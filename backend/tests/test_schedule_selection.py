@@ -13,9 +13,8 @@ sys.path.insert(0, str(BACKEND_DIR))
 from protocol_agent import (  # noqa: E402
     EvidenceFact,
     ScheduleAudit,
+    ScheduleChunkEvidence,
     ScheduleDocumentMap,
-    ScheduleTimingEvidence,
-    ScheduleVisitEvidence,
     _classification_guidance,
     run_protocol_extraction_agent,
     run_schedule_extraction_agent,
@@ -71,21 +70,24 @@ def _fact(evidence_id: str, claim: str) -> EvidenceFact:
 
 
 def _schedule() -> ExtractedSchedule:
+    # IDs match what evidence_sweep_node's merge actually produces: the single
+    # chunk these tests exercise is always chunk index 0, so every evidence_id
+    # minted by the mocked ScheduleChunkEvidence comes back prefixed "chunk0-".
     return ExtractedSchedule.model_validate({
         "schedule_kind": "linear",
         "canonical_plan": {
             "anchors": [{
                 "id": "anchor-baseline", "name": "Baseline",
-                "anchor_type": "first_dose", "evidence_ids": ["timing-01"],
+                "anchor_type": "first_dose", "evidence_ids": ["chunk0-timing-01"],
             }],
             "events": [{
                 "id": "event-baseline", "name": "Baseline", "event_type": "Baseline",
                 "timing": {
                     "kind": "offset", "anchor_id": "anchor-baseline",
                     "offset": {"value": 0, "unit": "day"},
-                    "source_label": "Day 1", "evidence_ids": ["timing-01"],
+                    "source_label": "Day 1", "evidence_ids": ["chunk0-timing-01"],
                 },
-                "evidence_ids": ["visit-01"],
+                "evidence_ids": ["chunk0-visit-01"],
             }],
         },
     })
@@ -154,15 +156,16 @@ def test_a_single_schedule_option_does_not_require_selection():
     generate, prompts, _ = _recording_generate([
         _classification(schedule_options=[SUBSTUDY_OPTIONS[0]]),
         _document_map(),
-        ScheduleTimingEvidence(visit_timing=[_fact("timing-01", "Baseline is Day 1")]),
-        ScheduleVisitEvidence(visit_columns=[_fact("visit-01", "Baseline")]),
-        _schedule(), _schedule(), _approving_audit(),
+        ScheduleChunkEvidence(
+            visit_timing=[_fact("timing-01", "Baseline is Day 1")],
+            visit_columns=[_fact("visit-01", "Baseline")]),
+        _schedule(), _approving_audit(),
     ])
 
     schedule = asyncio.run(run_schedule_extraction_agent(
         PDF, generate, max_refinements=0))
 
-    assert len(prompts) == 7, "one named schedule is not a selection to make"
+    assert len(prompts) == 5, "one named schedule is not a selection to make"
     assert schedule.requires_schedule_selection is False
     assert schedule.visits
 
@@ -171,15 +174,16 @@ def test_selecting_an_option_runs_the_full_pipeline_with_focused_guidance():
     generate, prompts, _ = _recording_generate([
         _classification(schedule_options=SUBSTUDY_OPTIONS),
         _document_map(),
-        ScheduleTimingEvidence(visit_timing=[_fact("timing-01", "Baseline is Day 1")]),
-        ScheduleVisitEvidence(visit_columns=[_fact("visit-01", "Baseline")]),
-        _schedule(), _schedule(), _approving_audit(),
+        ScheduleChunkEvidence(
+            visit_timing=[_fact("timing-01", "Baseline is Day 1")],
+            visit_columns=[_fact("visit-01", "Baseline")]),
+        _schedule(), _approving_audit(),
     ])
 
     schedule = asyncio.run(run_schedule_extraction_agent(
         PDF, generate, max_refinements=0, selected_schedule_option_id="ss3-m"))
 
-    assert len(prompts) == 7, "a selection lets discovery through to audit run"
+    assert len(prompts) == 5, "a selection lets discovery through to audit run"
     assert schedule.requires_schedule_selection is False
     assert schedule.visits
     classify_prompt = prompts[0]

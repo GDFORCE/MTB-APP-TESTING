@@ -602,6 +602,125 @@ def retrieve_protocol_pages(
     )
 
 
+class ProtocolPageChunk(BaseModel):
+    """One deterministic, non-scored slice of a protocol document.
+
+    Unlike ProtocolPageSelection (keyword-scored, may omit low-scoring pages),
+    chunk core_page_numbers partition the ENTIRE document with no gaps and no
+    overlap between chunks -- every page belongs to exactly one chunk's core,
+    so full coverage is a structural guarantee rather than a scoring outcome.
+    context_page_numbers extends a few pages past each edge (a table or a
+    governing rule can straddle a chunk boundary) purely so that boundary
+    content is legible; a fact is only this chunk's responsibility when its
+    page is in core_page_numbers, never when it is context-only, so the same
+    fact is never claimed by two chunks.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    chunk_index: int = Field(ge=0)
+    document_sha256: str
+    core_page_numbers: list[int]
+    context_page_numbers: list[int]
+    pages: list[RetrievedProtocolPage]
+
+
+def chunk_protocol_pages(
+    index: ProtocolDocumentIndex,
+    *,
+    core_pages: int = 22,
+    overlap_pages: int = 4,
+) -> list[ProtocolPageChunk]:
+    """Partition every page of the document into full-coverage chunks.
+
+    No scoring, no omission: every page number from 1 to index.page_count
+    appears in exactly one chunk's core_page_numbers.
+    """
+
+    if core_pages < 1:
+        raise ValueError("core_pages must be at least 1")
+    if overlap_pages < 0:
+        raise ValueError("overlap_pages cannot be negative")
+
+    page_by_number = {page.page_number: page for page in index.pages}
+    chunks: list[ProtocolPageChunk] = []
+    start = 1
+    chunk_index = 0
+    while start <= index.page_count:
+        end = min(start + core_pages - 1, index.page_count)
+        context_start = max(1, start - overlap_pages)
+        context_end = min(index.page_count, end + overlap_pages)
+        core_numbers = list(range(start, end + 1))
+        context_numbers = list(range(context_start, context_end + 1))
+        pages = [
+            RetrievedProtocolPage(
+                page_number=number,
+                evidence_id=page_by_number[number].evidence_id,
+                score=0,
+                reasons=["deterministic full-coverage chunk"],
+                text=page_by_number[number].text,
+                text_status=page_by_number[number].text_status,
+            )
+            for number in context_numbers
+        ]
+        chunks.append(ProtocolPageChunk(
+            chunk_index=chunk_index,
+            document_sha256=index.document_sha256,
+            core_page_numbers=core_numbers,
+            context_page_numbers=context_numbers,
+            pages=pages,
+        ))
+        chunk_index += 1
+        start = end + 1
+    return chunks
+
+
+def render_page_chunk(
+    chunk: ProtocolPageChunk,
+    *,
+    max_characters: int = 100_000,
+) -> str:
+    """Render one chunk's pages as page-cited AI context, core pages marked.
+
+    Every page carries an explicit CORE/CONTEXT role so the model knows which
+    pages it must extract facts from (core) and which are shown only to
+    interpret content that straddles the boundary (context) -- the
+    neighbouring chunk owns those pages' facts, so re-emitting them here
+    would double-count the same fact in the merged evidence pool.
+    """
+
+    if max_characters < 200:
+        raise ValueError("max_characters must be at least 200")
+    core_set = set(chunk.core_page_numbers)
+    rendered: list[str] = []
+    used = 0
+    omitted: list[int] = []
+    for page in chunk.pages:
+        role = (
+            "CORE — extract every schedule-relevant fact from this page"
+            if page.page_number in core_set else
+            "CONTEXT ONLY — do not extract facts from this page; it belongs "
+            "to a neighbouring chunk, shown here only so boundary-straddling "
+            "tables/rules are legible"
+        )
+        body = page.text.strip() or "[NO EMBEDDED TEXT — USE PDF VISION/OCR]"
+        block = (
+            f"[PDF page {page.page_number}; evidence_id={page.evidence_id}; "
+            f"text_status={page.text_status}; {role}]\n{body}"
+        )
+        additional = len(block) + (2 if rendered else 0)
+        if used + additional > max_characters:
+            omitted.append(page.page_number)
+            continue
+        rendered.append(block)
+        used += additional
+    if omitted:
+        notice = "[CONTEXT BUDGET OMITTED PAGES: " + ", ".join(map(str, omitted)) + "]"
+        if used + len(notice) + 2 <= max_characters:
+            rendered.append(notice)
+    return "\n\n".join(rendered)
+
+
 def render_page_selection(
     selection: ProtocolPageSelection,
     *,
@@ -644,10 +763,13 @@ __all__ = [
     "PdfIndexingError",
     "ProtocolDocumentIndex",
     "ProtocolDocumentIndexCache",
+    "ProtocolPageChunk",
     "ProtocolPageSelection",
     "RetrievedProtocolPage",
     "RetrievalTask",
     "build_protocol_document_index",
+    "chunk_protocol_pages",
+    "render_page_chunk",
     "render_page_selection",
     "retrieve_protocol_pages",
 ]

@@ -288,8 +288,10 @@ class TestUpdateRematerializes:
             pdoc = await server.db.patients.find_one({'id': patient['id']}, {'_id': 0})
             base = _as_dt(pdoc['enrolled_date'])
             insts = await _insts(patient['id'])
-            # seq2 (day 7) is upcoming/future → editable
-            assert insts[1]['status'] == 'upcoming'
+            # seq2 (day 7) is future/pending; the raw stored status is a
+            # static 'planned' until GET-time derives overdue/due/planned →
+            # editable regardless.
+            assert insts[1]['status'] == 'planned'
             async with make_client() as cli:
                 r = await cli.put(f"/api/visits/{tpls[1]['id']}", headers=sp_headers, json={
                     'name': f'Week1 Updated {RUN_ID}', 'day_offset': 10,
@@ -305,7 +307,7 @@ class TestUpdateRematerializes:
             assert _as_dt(inst2['scheduled_date']).date() == expected.date()
             assert _as_dt(inst2['window_start']) == expected - timedelta(days=5)
             assert _as_dt(inst2['window_end']) == expected + timedelta(days=5)
-            assert inst2['status'] == 'upcoming'
+            assert inst2['status'] == 'planned'
             # template itself was updated
             fresh_tpl = await server.db.visits.find_one({'id': tpls[1]['id']}, {'_id': 0})
             assert fresh_tpl['day_offset'] == 10 and fresh_tpl['window_days'] == 5
@@ -327,10 +329,12 @@ class TestUpdateRematerializes:
                 {'$set': {'status': 'completed', 'note': 'seen', 'updated_by': pi_user['id']}})
             before3 = await server.db.visit_instances.find_one(
                 {'patient_id': patient['id'], 'seq': 3}, {'_id': 0})
-            # seq1 (day 0) is 'missed' / past
+            # seq1 (day 0) is past its window, but the raw stored status
+            # stays a static 'planned' — nothing auto-marks it 'missed'; a
+            # visit only becomes 'missed' via an explicit staff PATCH.
             before1 = await server.db.visit_instances.find_one(
                 {'patient_id': patient['id'], 'seq': 1}, {'_id': 0})
-            assert before1['status'] == 'missed'
+            assert before1['status'] == 'planned'
             async with make_client() as cli:
                 r3 = await cli.put(f"/api/visits/{tpls[2]['id']}", headers=sp_headers,
                                    json={'name': f'Final {RUN_ID}', 'day_offset': 99})
@@ -343,10 +347,10 @@ class TestUpdateRematerializes:
             assert after3['status'] == 'completed'
             assert after3['name'] == before3['name']
             assert _as_dt(after3['scheduled_date']) == _as_dt(before3['scheduled_date'])
-            # missed/past instance untouched
+            # past instance untouched
             after1 = await server.db.visit_instances.find_one(
                 {'patient_id': patient['id'], 'seq': 1}, {'_id': 0})
-            assert after1['status'] == 'missed'
+            assert after1['status'] == 'planned'
             assert after1['name'] == before1['name']
             assert _as_dt(after1['scheduled_date']) == _as_dt(before1['scheduled_date'])
         run(flow())
@@ -466,7 +470,7 @@ class TestAddedVisitMaterializes:
             new_insts = [i for i in after if i['visit_template_id'] == new_tpl['id']]
             assert len(new_insts) == 1
             ni = new_insts[0]
-            assert ni['seq'] == 4 and ni['status'] == 'upcoming'
+            assert ni['seq'] == 4 and ni['status'] == 'planned'
             pdoc = await server.db.patients.find_one({'id': patient['id']}, {'_id': 0})
             base = _as_dt(pdoc['enrolled_date'])
             assert _as_dt(ni['scheduled_date']).date() == (base + timedelta(days=30)).date()

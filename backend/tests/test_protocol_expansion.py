@@ -105,6 +105,34 @@ def test_simple_day_range_uses_same_numbering_formula():
     assert simple_day_label_range_offsets("Day 14 to Day 17", **convention) == (13, 16)
 
 
+def test_simple_day_range_accepts_plural_days():
+    """CT25-007: a shared multi-day pre-dose/PK-sampling block is commonly
+    labeled with plural 'Days', not the singular 'Day' the original regex
+    required — "Days 12-14" must derive the same as "Day 12-14"."""
+    convention = {"anchor_study_day": 0, "includes_day_zero": True}
+    assert simple_day_label_range_offsets("Days 12-14", **convention) == (12, 14)
+    assert simple_day_label_range_offsets("Day 12-14", **convention) == (12, 14)
+
+
+def test_simple_day_range_accepts_a_comma_and_list_of_days():
+    """CT25-007's own protocol prose: 'in housed for 3 days (day 12, 13 and
+    day 14)'. A label copying that phrasing has no dash/'to' separator at
+    all, so it must be recognized via its enumerated day numbers instead —
+    spanning from the lowest to the highest day named."""
+    convention = {"anchor_study_day": 0, "includes_day_zero": True}
+    assert simple_day_label_range_offsets(
+        "Day 12, 13 and day 14", **convention) == (12, 14)
+    assert simple_day_label_range_offsets(
+        "Days 12, 13, 14", **convention) == (12, 14)
+    assert simple_day_label_range_offsets(
+        "Days 12, 13, and 14", **convention) == (12, 14)
+    # A single day and free prose are still left alone — only a label built
+    # entirely from digits/day/range vocabulary qualifies.
+    assert simple_day_label_range_offsets("Day 12", **convention) is None
+    assert simple_day_label_range_offsets(
+        "28 days after the last dose", **convention) is None
+
+
 def test_expansion_corrects_conflicting_model_arithmetic_and_flags_review():
     schedule = ExtractedSchedule(
         anchor_study_day=1,

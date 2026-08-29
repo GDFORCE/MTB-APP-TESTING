@@ -188,8 +188,10 @@ class TestEnrollmentMaterialization:
                             'status', 'note', 'updated_at'):
                     assert key in inst, f'missing field {key}'
                 assert inst['window_start'] < inst['scheduled_date'] < inst['window_end']
-            # enrolled 5 days ago: day 0 already past, day 7/14 in the future
-            assert [i['status'] for i in by_seq] == ['missed', 'upcoming', 'upcoming']
+            # enrolled 5 days ago, window_days=3: day 0's window (day -3..3)
+            # already closed -> overdue; day 7's window (day 4..10) is open ->
+            # due; day 14's window (day 11..17) hasn't opened yet -> planned.
+            assert [i['status'] for i in by_seq] == ['overdue', 'due', 'planned']
             # the shared templates were NOT touched
             for tpl in tpls:
                 raw = await server.db.visits.find_one({'id': tpl['id']}, {'_id': 0})
@@ -264,6 +266,143 @@ class TestEnrollmentMaterialization:
             assert created_again == 0
             count = await server.db.visit_instances.count_documents({'patient_id': patient['id']})
             assert count == len(tpls)
+        run(flow())
+
+
+# ── Arm-scoped materialization (arm-leak regression) ─────────────────────────
+class TestArmScopedMaterialization:
+    """materialize_visit_instances / _materialize_new_template_for_enrolled
+    filter templates by substudy_label but never by arm — a patient enrolled
+    under one arm currently receives every arm's visit instances. Both tests
+    FAIL today; they must pass unmodified once the arm filter lands."""
+
+    async def _two_arm_trial(self, sp_headers):
+        trial_doc, _ = await _make_trial(sp_headers, templates=())
+        specs = [(1, 'Screening A', 0, 'Arm A'), (2, 'Dosing A', 7, 'Arm A'),
+                 (3, 'Screening B', 0, 'Arm B'), (4, 'Dosing B', 7, 'Arm B')]
+        async with make_client() as cli:
+            for num, name, off, arm in specs:
+                r = await cli.post('/api/visits', headers=sp_headers, json={
+                    'trial_id': trial_doc['id'], 'visit_number': num, 'name': name,
+                    'day_offset': off, 'window_days': 3, 'arm_label': arm,
+                })
+                assert r.status_code == 200, r.text
+        return trial_doc
+
+    def test_enrollment_only_materializes_the_patients_own_arm(self, sponsor):
+        _, sp_headers = sponsor
+        async def flow():
+            trial_doc = await self._two_arm_trial(sp_headers)
+            patient_doc = {
+                'id': str(uuid.uuid4()), 'trial_id': trial_doc['id'],
+                'full_name': f'Arm Test {RUN_ID}',
+                'email': f'test-{RUN_ID}-arm-a@example.com',
+                'arm_label': 'Arm A',
+                'enrolled_date': server.now().date().isoformat(),
+                'completed_visit_ids': [], 'created_at': server.now(),
+            }
+            await server.db.patients.insert_one(patient_doc)
+            created = await server.materialize_visit_instances(patient_doc)
+            insts = await server.db.visit_instances.find(
+                {'patient_id': patient_doc['id']}, {'_id': 0}).to_list(10)
+            names = {i['name'] for i in insts}
+            assert created == 2 and names == {'Screening A', 'Dosing A'}, (
+                f'arm leak: expected only Arm A visits, got {names}')
+        run(flow())
+
+    def test_late_added_template_only_reaches_the_matching_arm(self, sponsor):
+        _, sp_headers = sponsor
+        async def flow():
+            trial_doc = await self._two_arm_trial(sp_headers)
+            patient_a = {
+                'id': str(uuid.uuid4()), 'trial_id': trial_doc['id'],
+                'full_name': f'Arm A Patient {RUN_ID}',
+                'email': f'test-{RUN_ID}-arm-a-late@example.com',
+                'arm_label': 'Arm A',
+                'enrolled_date': server.now().date().isoformat(),
+                'completed_visit_ids': [], 'created_at': server.now(),
+            }
+            await server.db.patients.insert_one(patient_a)
+            await server.materialize_visit_instances(patient_a)
+            async with make_client() as cli:
+                r = await cli.post('/api/visits', headers=sp_headers, json={
+                    'trial_id': trial_doc['id'], 'visit_number': 5,
+                    'name': 'Late Visit B', 'day_offset': 14, 'window_days': 3,
+                    'arm_label': 'Arm B',
+                })
+            assert r.status_code == 200, r.text
+            leaked = await server.db.visit_instances.count_documents(
+                {'patient_id': patient_a['id'], 'name': 'Late Visit B'})
+            assert leaked == 0, 'arm leak: Arm-B-only template reached an Arm-A patient'
+        run(flow())
+
+    def test_blank_arm_template_still_matches_every_patient(self, sponsor):
+        _, sp_headers = sponsor
+        async def flow():
+            trial_doc = await self._two_arm_trial(sp_headers)
+            async with make_client() as cli:
+                r = await cli.post('/api/visits', headers=sp_headers, json={
+                    'trial_id': trial_doc['id'], 'visit_number': 5,
+                    'name': 'Shared Baseline', 'day_offset': -1, 'window_days': 3,
+                })
+                assert r.status_code == 200, r.text
+            patient_a = {
+                'id': str(uuid.uuid4()), 'trial_id': trial_doc['id'],
+                'full_name': f'Shared Test A {RUN_ID}',
+                'email': f'test-{RUN_ID}-shared-a@example.com',
+                'arm_label': 'Arm A',
+                'enrolled_date': server.now().date().isoformat(),
+                'completed_visit_ids': [], 'created_at': server.now(),
+            }
+            patient_b = {
+                'id': str(uuid.uuid4()), 'trial_id': trial_doc['id'],
+                'full_name': f'Shared Test B {RUN_ID}',
+                'email': f'test-{RUN_ID}-shared-b@example.com',
+                'arm_label': 'Arm B',
+                'enrolled_date': server.now().date().isoformat(),
+                'completed_visit_ids': [], 'created_at': server.now(),
+            }
+            await server.db.patients.insert_many([patient_a, patient_b])
+            await server.materialize_visit_instances(patient_a)
+            await server.materialize_visit_instances(patient_b)
+            for patient in (patient_a, patient_b):
+                shared = await server.db.visit_instances.count_documents(
+                    {'patient_id': patient['id'], 'name': 'Shared Baseline'})
+                assert shared == 1, (
+                    f"untagged template must reach every arm, missing for {patient['arm_label']}")
+        run(flow())
+
+    def test_omitted_arm_on_fully_arm_tagged_trial_yields_no_visits(self, sponsor):
+        _, sp_headers = sponsor
+        async def flow():
+            trial_doc = await self._two_arm_trial(sp_headers)
+            patient_doc = {
+                'id': str(uuid.uuid4()), 'trial_id': trial_doc['id'],
+                'full_name': f'No Arm Test {RUN_ID}',
+                'email': f'test-{RUN_ID}-no-arm@example.com',
+                'enrolled_date': server.now().date().isoformat(),
+                'completed_visit_ids': [], 'created_at': server.now(),
+            }
+            await server.db.patients.insert_one(patient_doc)
+            created = await server.materialize_visit_instances(patient_doc)
+            assert created == 0, (
+                'omitting arm_label on a fully arm-tagged trial must fail closed, not leak every arm')
+        run(flow())
+
+    def test_list_trial_arms_endpoint(self, sponsor):
+        _, sp_headers = sponsor
+        async def flow():
+            bare_trial, _ = await _make_trial(sp_headers, templates=())
+            async with make_client() as cli:
+                r = await cli.get(f"/api/trials/{bare_trial['id']}/arms", headers=sp_headers)
+            assert r.status_code == 200, r.text
+            assert r.json() == []
+
+            trial_doc = await self._two_arm_trial(sp_headers)
+            async with make_client() as cli:
+                r = await cli.get(f"/api/trials/{trial_doc['id']}/arms", headers=sp_headers)
+            assert r.status_code == 200, r.text
+            assert r.json() == ['Arm A', 'Arm B']
         run(flow())
 
 
@@ -488,7 +627,9 @@ class TestVisitsMine:
                 for key in ('name', 'scheduled_date', 'status', 'window_days',
                             'activities', 'visit_number', 'patient_id'):
                     assert key in v, f'missing field {key}'
-            assert [v['status'] for v in visits] == ['missed', 'upcoming', 'upcoming']
+            # same day 0/7/14, days_ago=5, window_days=3 derivation as
+            # TestEnrollmentMaterialization.test_enroll_creates_one_instance_per_template
+            assert [v['status'] for v in visits] == ['overdue', 'due', 'planned']
         run(flow())
 
     def test_enriches_with_site_pi_and_checklist(self, sponsor, pi):
@@ -543,8 +684,11 @@ class TestVisitsMine:
             visits = r.json()
             assert len(visits) == len(tpls)
             for v in visits:
-                assert v['scheduled_date'] and v['status'] in (
-                    'upcoming', 'completed', 'missed', 'scheduled')
+                assert v['scheduled_date']
+            # same day 0/7/14, days_ago=5, window_days=3 derivation as the
+            # materialized-instance tests above — the fallback path must
+            # compute the identical live overdue/due/planned status.
+            assert [v['status'] for v in visits] == ['overdue', 'due', 'planned']
         run(flow())
 
     def test_exact_detail_is_scoped_and_returns_approved_fields(self, pi, crc):
@@ -708,9 +852,9 @@ class TestTasks:
                                        crc_id=crc_user['id'], days_ago=10)
             today_pt = await _enroll(pi_headers, t['id'], pi_id=pi_user['id'],
                                      crc_id=crc_user['id'], days_ago=0)
-            # materialization stamps past-dated visits 'missed' (incl. earlier
-            # today); flip both to 'scheduled' so they represent genuinely
-            # pending — not written-off — visits, which is what the queue shows
+            # materialization always stores a static 'planned'; flip both to
+            # 'scheduled' (still one of the recompute-triggering statuses) so
+            # the queue derives their real overdue/due state from the dates
             await server.db.visit_instances.update_many(
                 {'patient_id': {'$in': [overdue_pt['id'], today_pt['id']]}},
                 {'$set': {'status': 'scheduled'}})
@@ -850,12 +994,22 @@ class TestTasks:
         pi_user, pi_headers = pi
         async def flow():
             t, _ = await _make_trial(sp_headers, templates=((0, 'Only Visit'),))
-            # enrolled 10 days ago with day_offset 0 -> materialized as 'missed'
+            # enrolled 10 days ago with day_offset 0 -> genuinely past its
+            # window, so it would otherwise surface as 'overdue' (see
+            # test_pending_past_window_is_returned_as_overdue). A visit only
+            # ever becomes the terminal 'missed' via an explicit staff mark
+            # (PATCH /visit-instances/{id}) — materialization itself never
+            # writes it, so that's the action under test here.
             missed_pt = await _enroll(pi_headers, t['id'], pi_id=pi_user['id'], days_ago=10)
             inst = await server.db.visit_instances.find_one(
                 {'patient_id': missed_pt['id']}, {'_id': 0})
-            assert inst and inst['status'] == 'missed'
+            assert inst is not None
             async with make_client() as cli:
+                patch = await cli.patch(
+                    f"/api/visit-instances/{inst['id']}",
+                    headers=pi_headers, json={'status': 'missed'},
+                )
+                assert patch.status_code == 200, patch.text
                 r = await cli.get('/api/tasks', headers=pi_headers)
             assert r.status_code == 200, r.text
             assert not any(x['type'] in ('overdue_visit', 'visit_today')
@@ -898,12 +1052,16 @@ class TestPatientsListEnrichment:
     def _row(self, rows, patient_id):
         return next((p for p in rows if p['id'] == patient_id), None)
 
-    def test_active_with_next_upcoming_visit(self, pi, trial):
-        # enrolled 5 days ago, templates day 0/7/14 → day0 missed, 7&14 upcoming
-        trial_doc, tpls = trial
+    def test_active_with_next_upcoming_visit(self, sponsor, pi):
+        # All-future templates so nothing is due/overdue yet — next_visit is
+        # simply the soonest planned instance. (The overdue case is covered
+        # separately by test_overdue_when_pending_visit_is_past_due below.)
+        _, sp_headers = sponsor
         pi_user, pi_headers = pi
         async def flow():
-            patient = await _enroll(pi_headers, trial_doc['id'], pi_id=pi_user['id'], days_ago=5)
+            t, tpls = await _make_trial(
+                sp_headers, templates=((7, 'V1'), (14, 'V2'), (21, 'V3')))
+            patient = await _enroll(pi_headers, t['id'], pi_id=pi_user['id'], days_ago=0)
             async with make_client() as cli:
                 r = await cli.get('/api/patients', headers=pi_headers)
             assert r.status_code == 200, r.text
@@ -912,9 +1070,9 @@ class TestPatientsListEnrichment:
             assert row['status'] == 'active'
             nv = row['next_visit']
             assert nv is not None, 'active patient should surface a next visit'
-            assert nv['seq'] == 2                       # day-7 is the soonest upcoming
-            assert nv['name'] == tpls[1]['name']
-            assert nv['status'] == 'upcoming'
+            assert nv['seq'] == 1                       # day-7 is the soonest planned
+            assert nv['name'] == tpls[0]['name']
+            assert nv['status'] == 'planned'
             assert nv['scheduled_date']                 # ISO string present
             assert 'id' in nv
         run(flow())
@@ -940,8 +1098,12 @@ class TestPatientsListEnrichment:
         pi_user, pi_headers = pi
         async def flow():
             patient = await _enroll(pi_headers, trial_doc['id'], pi_id=pi_user['id'], days_ago=5)
+            # Both fields: _effective_visit_status reads operational_status
+            # first (same precedence PATCH /visit-instances/{id} writes with),
+            # so status alone wouldn't override the stored 'planned'.
             await server.db.visit_instances.update_many(
-                {'patient_id': patient['id']}, {'$set': {'status': 'completed'}})
+                {'patient_id': patient['id']},
+                {'$set': {'status': 'completed', 'operational_status': 'completed'}})
             async with make_client() as cli:
                 r = await cli.get('/api/patients', headers=pi_headers)
             row = self._row(r.json(), patient['id'])

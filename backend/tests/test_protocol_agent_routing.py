@@ -16,9 +16,8 @@ sys.path.insert(0, str(BACKEND_DIR))
 from protocol_agent import (  # noqa: E402
     EvidenceFact,
     ScheduleAudit,
+    ScheduleChunkEvidence,
     ScheduleDocumentMap,
-    ScheduleTimingEvidence,
-    ScheduleVisitEvidence,
     _classification_guidance,
     run_schedule_extraction_agent,
 )
@@ -69,21 +68,24 @@ def _fact(evidence_id: str, claim: str) -> EvidenceFact:
 
 
 def _schedule() -> ExtractedSchedule:
+    # IDs match what evidence_sweep_node's merge actually produces: the single
+    # chunk these tests exercise is always chunk index 0, so every evidence_id
+    # minted by the mocked ScheduleChunkEvidence comes back prefixed "chunk0-".
     return ExtractedSchedule.model_validate({
         "schedule_kind": "linear",
         "canonical_plan": {
             "anchors": [{
                 "id": "anchor-baseline", "name": "Baseline",
-                "anchor_type": "first_dose", "evidence_ids": ["timing-01"],
+                "anchor_type": "first_dose", "evidence_ids": ["chunk0-timing-01"],
             }],
             "events": [{
                 "id": "event-baseline", "name": "Baseline", "event_type": "Baseline",
                 "timing": {
                     "kind": "offset", "anchor_id": "anchor-baseline",
                     "offset": {"value": 0, "unit": "day"},
-                    "source_label": "Day 1", "evidence_ids": ["timing-01"],
+                    "source_label": "Day 1", "evidence_ids": ["chunk0-timing-01"],
                 },
-                "evidence_ids": ["visit-01"],
+                "evidence_ids": ["chunk0-visit-01"],
             }],
         },
     })
@@ -135,12 +137,18 @@ NARRATIVE_PAGE = (
 )
 
 
-def test_every_ai_stage_receives_the_retrieved_page_packet():
+def test_page_retrieval_reaches_classify_discover_and_evidence_sweep():
+    """classify/discover get a keyword-scored excerpt; evidence_sweep gets its
+    own full-coverage chunk instead; synthesize/audit get neither, since the
+    merged evidence pool from evidence_sweep is already complete — a scored
+    excerpt on top of it would be redundant cost with no coverage benefit
+    (see protocol_agent._STAGES_WITHOUT_RETRIEVAL)."""
     generate, prompts, _ = _recording_generate([
         _classification(), _document_map(),
-        ScheduleTimingEvidence(visit_timing=[_fact("timing-01", "Baseline is Day 1")]),
-        ScheduleVisitEvidence(visit_columns=[_fact("visit-01", "Baseline")]),
-        _schedule(), _schedule(), _approving_audit(),
+        ScheduleChunkEvidence(
+            visit_timing=[_fact("timing-01", "Baseline is Day 1")],
+            visit_columns=[_fact("visit-01", "Baseline")]),
+        _schedule(), _approving_audit(),
     ])
     index = _index_of([NARRATIVE_PAGE, SCHEDULE_PAGE])
 
@@ -148,23 +156,43 @@ def test_every_ai_stage_receives_the_retrieved_page_packet():
         PDF, generate, max_refinements=0, page_index=index))
 
     assert schedule.visits, "the graph must still produce the projected schedule"
-    assert len(prompts) == 7
-    for prompt in prompts:
+    # classify, discover, evidence_sweep (1 chunk for a 2-page doc), synthesize,
+    # audit — timing/visit_evidence collapsed into one sweep stage, and there
+    # is no separate confirmation stage any more.
+    assert len(prompts) == 5
+    classify_prompt, discover_prompt, sweep_prompt = prompts[0], prompts[1], prompts[2]
+
+    for prompt in (classify_prompt, discover_prompt):
         assert "RETRIEVED SOURCE PAGES" in prompt
         assert "Schedule of Assessments" in prompt
         assert index.document_sha256 in prompt
     # The packet narrows attention without becoming the only permitted source:
     # the attached PDF must remain authoritative for pages it left out.
-    assert "attached PDF remains" in prompts[0]
-    assert "page-2-" in prompts[0], "page evidence IDs must be citable"
+    assert "attached PDF remains" in classify_prompt
+    assert "page-2-" in classify_prompt, "page evidence IDs must be citable"
+
+    # evidence_sweep reads its own full-coverage chunk, not the scored excerpt.
+    assert "RETRIEVED SOURCE PAGES" not in sweep_prompt
+    assert "DOCUMENT PAGES FOR THIS CHUNK" in sweep_prompt
+    assert "Schedule of Assessments" in sweep_prompt
+    assert "CORE" in sweep_prompt
+
+    # synthesize/audit rely on the merged evidence pool, not a re-scored
+    # excerpt: no retrieval header, but the pool (with its chunk-namespaced
+    # evidence IDs) does reach them.
+    for prompt in prompts[3:]:
+        assert "RETRIEVED SOURCE PAGES" not in prompt
+        assert "DOCUMENT PAGES FOR THIS CHUNK" not in prompt
+        assert "chunk0-timing-01" in prompt
 
 
 def test_page_retrieval_failure_never_blocks_extraction():
     generate, prompts, _ = _recording_generate([
         _classification(), _document_map(),
-        ScheduleTimingEvidence(visit_timing=[_fact("timing-01", "Baseline is Day 1")]),
-        ScheduleVisitEvidence(visit_columns=[_fact("visit-01", "Baseline")]),
-        _schedule(), _schedule(), _approving_audit(),
+        ScheduleChunkEvidence(
+            visit_timing=[_fact("timing-01", "Baseline is Day 1")],
+            visit_columns=[_fact("visit-01", "Baseline")]),
+        _schedule(), _approving_audit(),
     ])
 
     # No page index: an unreadable/scanned PDF must still extract from the PDF.
@@ -192,13 +220,13 @@ def test_no_schedule_classification_stops_after_discovery():
             evidence=["Investigator CV, page 1"]),
         _document_map(has_schedule=False, schedule_kind="none", schedule_locations=[]),
         # Nothing below may be consumed.
-        _schedule(), _schedule(), _approving_audit(),
+        _schedule(), _approving_audit(),
     ])
 
     schedule = asyncio.run(run_schedule_extraction_agent(PDF, generate))
 
-    assert len(prompts) == 2, "timing/visit/builder/confirmer/audit must be skipped"
-    assert len(remaining) == 3
+    assert len(prompts) == 2, "evidence sweep/synthesize/audit must be skipped"
+    assert len(remaining) == 2
     assert schedule.schedule_kind == "none"
     assert schedule.visits == []
     assert any("no visit schedule" in item for item in schedule.assumptions)
@@ -211,15 +239,16 @@ def test_discovery_disagreement_still_runs_full_schedule_extraction():
             document_type="reference", analysis_task="no_schedule",
             schedule_archetypes=[], has_schedule=False),
         _document_map(),  # discovery DID find a schedule table
-        ScheduleTimingEvidence(visit_timing=[_fact("timing-01", "Baseline is Day 1")]),
-        ScheduleVisitEvidence(visit_columns=[_fact("visit-01", "Baseline")]),
-        _schedule(), _schedule(), _approving_audit(),
+        ScheduleChunkEvidence(
+            visit_timing=[_fact("timing-01", "Baseline is Day 1")],
+            visit_columns=[_fact("visit-01", "Baseline")]),
+        _schedule(), _approving_audit(),
     ])
 
     schedule = asyncio.run(run_schedule_extraction_agent(
         PDF, generate, max_refinements=0))
 
-    assert len(prompts) == 7
+    assert len(prompts) == 5
     assert schedule.visits, "a schedule discovery found must not be thrown away"
 
 
@@ -249,9 +278,10 @@ def test_guidance_reaches_the_builder_but_not_the_classifier():
     generate, prompts, _ = _recording_generate([
         _classification(schedule_archetypes=["crossover"]),
         _document_map(),
-        ScheduleTimingEvidence(visit_timing=[_fact("timing-01", "Baseline is Day 1")]),
-        ScheduleVisitEvidence(visit_columns=[_fact("visit-01", "Baseline")]),
-        _schedule(), _schedule(), _approving_audit(),
+        ScheduleChunkEvidence(
+            visit_timing=[_fact("timing-01", "Baseline is Day 1")],
+            visit_columns=[_fact("visit-01", "Baseline")]),
+        _schedule(), _approving_audit(),
     ])
 
     asyncio.run(run_schedule_extraction_agent(PDF, generate, max_refinements=0))
@@ -282,9 +312,10 @@ def test_page_index_is_cached_per_document_when_configured(tmp_path, monkeypatch
     for _ in range(2):
         generate, prompts, _ = _recording_generate([
             _classification(), _document_map(),
-            ScheduleTimingEvidence(visit_timing=[_fact("timing-01", "Baseline is Day 1")]),
-            ScheduleVisitEvidence(visit_columns=[_fact("visit-01", "Baseline")]),
-            _schedule(), _schedule(), _approving_audit(),
+            ScheduleChunkEvidence(
+                visit_timing=[_fact("timing-01", "Baseline is Day 1")],
+                visit_columns=[_fact("visit-01", "Baseline")]),
+            _schedule(), _approving_audit(),
         ])
         asyncio.run(run_schedule_extraction_agent(PDF, generate, max_refinements=0))
         assert "RETRIEVED SOURCE PAGES" in prompts[0]
@@ -311,9 +342,10 @@ def test_unwritable_page_index_cache_never_blocks_extraction(tmp_path, monkeypat
 
     generate, prompts, _ = _recording_generate([
         _classification(), _document_map(),
-        ScheduleTimingEvidence(visit_timing=[_fact("timing-01", "Baseline is Day 1")]),
-        ScheduleVisitEvidence(visit_columns=[_fact("visit-01", "Baseline")]),
-        _schedule(), _schedule(), _approving_audit(),
+        ScheduleChunkEvidence(
+            visit_timing=[_fact("timing-01", "Baseline is Day 1")],
+            visit_columns=[_fact("visit-01", "Baseline")]),
+        _schedule(), _approving_audit(),
     ])
 
     schedule = asyncio.run(run_schedule_extraction_agent(

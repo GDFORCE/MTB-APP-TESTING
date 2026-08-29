@@ -52,12 +52,17 @@ import httpx
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from schedule_schema import (
+    _SIMPLE_DAY_LABEL,
+    _SIMPLE_DAY_RANGE_LABEL,
     CanonicalSchedulePlan,
     DocumentTaskClassification,
     ScheduleOption,
     SourceEvidence,
     canonical_from_flat,
     project_canonical_plan,
+    simple_day_label_offset,
+    simple_day_label_range_offsets,
+    study_day_to_offset,
     validate_canonical_plan,
 )
 
@@ -470,97 +475,12 @@ class ExtractionUnavailable(ExtractionError):
 # ──────────────────────────── expansion (pure) ────────────────────────────
 # Deterministic, no network, no API key — this is where all schedule arithmetic
 # lives so it can be unit-tested against real protocols offline.
-
-_SIMPLE_DAY_LABEL = re.compile(r"^\s*day\s*([+-]?\d+)\s*$", re.IGNORECASE)
-_SIMPLE_DAY_RANGE_LABEL = re.compile(
-    r"^\s*day\s*([+-]?\d+)\s*(?:-|–|—|to)\s*(?:day\s*)?([+-]?\d+)\s*$",
-    re.IGNORECASE,
-)
-
-
-def study_day_to_offset(
-    study_day: int,
-    *,
-    anchor_study_day: int,
-    includes_day_zero: Optional[bool],
-) -> int:
-    """Convert one printed ``Day N`` into the canonical calendar offset.
-
-    Day-numbering conventions skip zero only when the anchor is Day 1 and the
-    protocol explicitly has no Day 0. A printed Day 0 is invalid in that
-    convention instead of being silently moved to the baseline date.
-    """
-    if anchor_study_day not in (0, 1):
-        raise ValueError("anchor_study_day must be 0 or 1")
-    if anchor_study_day == 0:
-        if includes_day_zero is False:
-            raise ValueError("A Day 0 anchor requires includes_day_zero=true")
-        return int(study_day)
-    if study_day >= 1:
-        return int(study_day) - 1
-    if includes_day_zero is None:
-        raise ValueError(
-            "includes_day_zero is required for Day 0 or negative Day labels")
-    if includes_day_zero:
-        return int(study_day) - 1
-    if study_day == 0:
-        raise ValueError("Day 0 is invalid when the protocol excludes Day 0")
-    # In a Day-1/no-Day-0 sequence, Day -1 is the prior calendar day while
-    # positive labels are one-based (Day 1 is offset zero).
-    return int(study_day) - 1 if study_day >= 1 else int(study_day)
-
-
-def simple_day_label_offset(
-    source_day_label: Optional[str],
-    *,
-    anchor_study_day: Optional[int],
-    includes_day_zero: Optional[bool],
-) -> Optional[int]:
-    """Convert only an exact ``Day N`` label when convention metadata is known.
-
-    Cycle labels, Week 1, ranges, and prose stay untouched because converting
-    them requires protocol-specific evidence. ``None`` means "do not infer".
-    """
-    if anchor_study_day is None:
-        return None
-    match = _SIMPLE_DAY_LABEL.fullmatch(str(source_day_label or ""))
-    if not match:
-        return None
-    study_day = int(match.group(1))
-    if anchor_study_day == 1 and includes_day_zero is None and study_day <= 0:
-        return None
-    return study_day_to_offset(
-        study_day,
-        anchor_study_day=anchor_study_day,
-        includes_day_zero=includes_day_zero,
-    )
-
-
-def simple_day_label_range_offsets(
-    source_day_label: Optional[str],
-    *,
-    anchor_study_day: Optional[int],
-    includes_day_zero: Optional[bool],
-) -> Optional[tuple[int, int]]:
-    """Convert only exact ``Day A-B``/``Day A to Day B`` source labels."""
-    if anchor_study_day is None:
-        return None
-    match = _SIMPLE_DAY_RANGE_LABEL.fullmatch(str(source_day_label or ""))
-    if not match:
-        return None
-    start_day, end_day = int(match.group(1)), int(match.group(2))
-    if (anchor_study_day == 1 and includes_day_zero is None
-            and (start_day <= 0 or end_day <= 0)):
-        return None
-    start = study_day_to_offset(
-        start_day, anchor_study_day=anchor_study_day,
-        includes_day_zero=includes_day_zero)
-    end = study_day_to_offset(
-        end_day, anchor_study_day=anchor_study_day,
-        includes_day_zero=includes_day_zero)
-    if end < start:
-        raise ValueError("day range ends before it starts")
-    return start, end
+#
+# _SIMPLE_DAY_LABEL/_SIMPLE_DAY_RANGE_LABEL, study_day_to_offset,
+# simple_day_label_offset and simple_day_label_range_offsets now live in
+# schedule_schema.py so the SAME printed-day-number cross-check protects both
+# schedule shapes: this module's legacy flat-visits path below, and the
+# canonical_plan path's build_row (schedule_schema.project_canonical_plan).
 
 
 def normalize_extracted_timing(
@@ -795,6 +715,8 @@ def expand_schedule(schedule: ExtractedSchedule) -> ExtractedSchedule:
         projected, projection_warnings = project_canonical_plan(
             schedule.canonical_plan,
             open_ended_preview_count=OPEN_ENDED_CYCLE_CAP,
+            anchor_study_day=schedule.anchor_study_day,
+            includes_day_zero=schedule.includes_day_zero,
         )
         visits = [ExtractedVisit.model_validate(row) for row in projected]
         warnings.extend(projection_warnings)
@@ -1356,9 +1278,18 @@ class GeminiProtocolExtractor:
                         data=pdf_bytes,
                         mime_type="application/pdf",
                     ))
-                contents.append(prompt + retry_instruction)
+                prompt_text = prompt + retry_instruction
+                if cached_content:
+                    # The Gemini API rejects system_instruction on a
+                    # GenerateContent request that also sets cached_content
+                    # ("CachedContent can not be used with ... system_instruction").
+                    # Every stage uses a different system_instruction, so it
+                    # can't be baked into the shared per-extraction cache
+                    # either — fold it into this call's own content instead so
+                    # the cache still only ever holds the (large) PDF.
+                    prompt_text = system_instruction + "\n\n" + prompt_text
+                contents.append(prompt_text)
                 config_kwargs = dict(
-                    system_instruction=system_instruction,
                     max_output_tokens=max_tokens,
                     temperature=0.1,
                     response_mime_type="application/json",
@@ -1378,6 +1309,8 @@ class GeminiProtocolExtractor:
                 )
                 if cached_content:
                     config_kwargs["cached_content"] = cached_content
+                else:
+                    config_kwargs["system_instruction"] = system_instruction
                 response = await async_client.models.generate_content(
                     model=model_override or self._model,
                     contents=contents,
@@ -1429,15 +1362,15 @@ class GeminiProtocolExtractor:
             f"Gemini could not return valid {schema.__name__} structured JSON "
             "after one retry") from last_parse_error
 
-    # A protocol extraction is 7-13 sequential model calls (classify, discover,
-    # timing, visit_evidence, synthesize, confirm, audit, and up to 2 more
-    # refine/confirm/audit rounds). Every one of them used to re-attach the
-    # full PDF, so a 100-page protocol paid for its own document tokens 7-13
-    # times over. A Gemini context cache uploads the PDF once per extraction
-    # and every stage call references it instead — caching is purely a cost
-    # optimization, so any failure to create/use it (too small, quota, expiry
-    # mid-pipeline) must fall back to the old per-call attachment, never fail
-    # the extraction itself.
+    # A protocol extraction is classify + discover + one evidence_sweep call
+    # per document chunk + synthesize + audit, plus up to 2 more repair/audit
+    # rounds — for a 100-page protocol (~5 chunks), roughly 9-13 calls. Every
+    # one of them used to re-attach the full PDF, so a large protocol paid
+    # for its own document tokens 9-13 times over. A Gemini context cache
+    # uploads the PDF once per extraction and every stage call references it
+    # instead — caching is purely a cost optimization, so any failure to
+    # create/use it (too small, quota, expiry mid-pipeline) must fall back to
+    # the old per-call attachment, never fail the extraction itself.
     _CACHE_MIN_BYTES = 100_000
 
     async def _create_pdf_cache(self, pdf_bytes: bytes) -> "_PdfCacheHandle | None":
@@ -1524,29 +1457,15 @@ class GeminiProtocolExtractor:
 
         max_refinements = int(os.getenv(
             "PROTOCOL_EXTRACTION_MAX_REFINEMENTS", "2"))
-        confirmation_model = os.getenv(
-            "GEMINI_PROTOCOL_CONFIRMATION_MODEL",
-            os.getenv("PROTOCOL_CONFIRMATION_MODEL", self._model),
-        )
 
         handle_box = [await self._create_pdf_cache(pdf_bytes)]
         generate = self._cached_generate(pdf_bytes, handle_box)
-        # A cache is created for self._model specifically; a confirmation call
-        # to a *different* model can never use it, so route those straight to
-        # the uncached path instead of paying for a cached call that would
-        # always fail over.
-        confirm_base = generate if confirmation_model == self._model else self._generate
-
-        async def confirm_generate(*args, **kwargs):
-            return await confirm_base(
-                *args, **kwargs, model_override=confirmation_model)
 
         try:
             expanded = await run_schedule_extraction_agent(
                 pdf_bytes,
                 generate,
                 max_refinements=max_refinements,
-                confirmation_generate=confirm_generate,
                 selected_schedule_option_id=selected_schedule_option_id,
             )
         finally:
@@ -1570,13 +1489,13 @@ class GeminiProtocolExtractor:
         """Extract every independent Schedule of Assessments the PDF prints.
 
         Mirrors extract()'s setup exactly (one page index, one Gemini PDF
-        context cache, the same confirmation-model routing) but shares both
-        across every substudy's pipeline run instead of building them once
-        per call — the direct extension of "one cache per extraction" to
-        "one cache per document, reused by every substudy extracted from
-        it." A single-schedule protocol costs exactly what extract() costs
-        today; a multi-substudy protocol runs one full pipeline per
-        substudy, bounded to a few concurrent pipelines at once.
+        context cache) but shares both across every substudy's pipeline run
+        instead of building them once per call — the direct extension of
+        "one cache per extraction" to "one cache per document, reused by
+        every substudy extracted from it." A single-schedule protocol costs
+        exactly what extract() costs today; a multi-substudy protocol runs
+        one full pipeline per substudy, bounded to a few concurrent
+        pipelines at once.
         """
         from protocol_agent import (
             _build_page_index,
@@ -1585,28 +1504,18 @@ class GeminiProtocolExtractor:
 
         max_refinements = int(os.getenv(
             "PROTOCOL_EXTRACTION_MAX_REFINEMENTS", "2"))
-        confirmation_model = os.getenv(
-            "GEMINI_PROTOCOL_CONFIRMATION_MODEL",
-            os.getenv("PROTOCOL_CONFIRMATION_MODEL", self._model),
-        )
         concurrency = int(os.getenv(
             "PROTOCOL_EXTRACTION_VARIANT_CONCURRENCY", "3"))
 
         page_index = await _build_page_index(pdf_bytes)
         handle_box = [await self._create_pdf_cache(pdf_bytes)]
         generate = self._cached_generate(pdf_bytes, handle_box)
-        confirm_base = generate if confirmation_model == self._model else self._generate
-
-        async def confirm_generate(*args, **kwargs):
-            return await confirm_base(
-                *args, **kwargs, model_override=confirmation_model)
 
         try:
             results = await run_schedule_extraction_agent_for_all_options(
                 pdf_bytes,
                 generate,
                 max_refinements=max_refinements,
-                confirmation_generate=confirm_generate,
                 page_index=page_index,
                 concurrency=max(1, concurrency),
             )
@@ -1626,25 +1535,15 @@ class GeminiProtocolExtractor:
 
         max_refinements = int(os.getenv(
             "PROTOCOL_EXTRACTION_MAX_REFINEMENTS", "2"))
-        confirmation_model = os.getenv(
-            "GEMINI_PROTOCOL_CONFIRMATION_MODEL",
-            os.getenv("PROTOCOL_CONFIRMATION_MODEL", self._model),
-        )
 
         handle_box = [await self._create_pdf_cache(pdf_bytes)]
         generate = self._cached_generate(pdf_bytes, handle_box)
-        confirm_base = generate if confirmation_model == self._model else self._generate
-
-        async def confirm_generate(*args, **kwargs):
-            return await confirm_base(
-                *args, **kwargs, model_override=confirmation_model)
 
         try:
             return await run_protocol_extraction_agent(
                 pdf_bytes,
                 generate,
                 max_refinements=max_refinements,
-                confirmation_generate=confirm_generate,
                 selected_schedule_option_id=selected_schedule_option_id,
             )
         finally:
@@ -1665,28 +1564,18 @@ class GeminiProtocolExtractor:
 
         max_refinements = int(os.getenv(
             "PROTOCOL_EXTRACTION_MAX_REFINEMENTS", "2"))
-        confirmation_model = os.getenv(
-            "GEMINI_PROTOCOL_CONFIRMATION_MODEL",
-            os.getenv("PROTOCOL_CONFIRMATION_MODEL", self._model),
-        )
         concurrency = int(os.getenv(
             "PROTOCOL_EXTRACTION_VARIANT_CONCURRENCY", "3"))
 
         page_index = await _build_page_index(pdf_bytes)
         handle_box = [await self._create_pdf_cache(pdf_bytes)]
         generate = self._cached_generate(pdf_bytes, handle_box)
-        confirm_base = generate if confirmation_model == self._model else self._generate
-
-        async def confirm_generate(*args, **kwargs):
-            return await confirm_base(
-                *args, **kwargs, model_override=confirmation_model)
 
         try:
             details, results = await run_protocol_extraction_agent_for_all_options(
                 pdf_bytes,
                 generate,
                 max_refinements=max_refinements,
-                confirmation_generate=confirm_generate,
                 page_index=page_index,
                 concurrency=max(1, concurrency),
             )

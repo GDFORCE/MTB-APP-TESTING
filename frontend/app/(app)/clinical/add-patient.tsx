@@ -98,6 +98,12 @@ export default function AddPatient() {
   const [substudies, setSubstudies] = useState<string[]>([]);
   const [substudyLabel, setSubstudyLabel] = useState<string | null>(null);
   const [substudyOpen, setSubstudyOpen] = useState(false);
+  // Only populated for a trial whose visit templates are arm-tagged (more
+  // than one distinct arm/treatment-sequence). Empty for every ordinary
+  // trial, and the picker below never renders in that case.
+  const [arms, setArms] = useState<string[]>([]);
+  const [armLabel, setArmLabel] = useState<string | null>(null);
+  const [armOpen, setArmOpen] = useState(false);
   const [baseline, setBaseline] = useState("5 May 2025");
   const [scheduleGenerated, setScheduleGenerated] = useState(false);
   const [scheduleVisits, setScheduleVisits] = useState<ScheduleVisit[]>([]);
@@ -184,6 +190,27 @@ export default function AddPatient() {
     return () => { alive = false; };
   }, [trialId]);
 
+  useEffect(() => {
+    let alive = true;
+    setArms([]);
+    setArmLabel(null);
+    if (!trialId) return () => { alive = false; };
+    (async () => {
+      try {
+        const response = await api.get(`/trials/${trialId}/arms`);
+        const labels: string[] = Array.isArray(response.data) ? response.data : [];
+        if (!alive) return;
+        setArms(labels);
+        if (labels.length === 1) setArmLabel(labels[0]);
+      } catch {
+        // A trial without this endpoint's data (or a permission edge case)
+        // just falls back to no picker — never blocks enrollment.
+        if (alive) setArms([]);
+      }
+    })();
+    return () => { alive = false; };
+  }, [trialId]);
+
   const selectedTrial = trials.find(t => t.id === trialId);
   const selectedPi = pis.find(pi => pi.id === piId);
   const suggestedInitials = initialsFromName(fullName);
@@ -201,6 +228,7 @@ export default function AddPatient() {
     && scheduleVisits.length > 0
     && (!needsPiSelection || !!piId)
     && (substudies.length <= 1 || !!substudyLabel)
+    && (arms.length <= 1 || !!armLabel)
     && !subjectDuplicate
     && !emailDuplicate
     && !saving;
@@ -214,9 +242,11 @@ export default function AddPatient() {
           ? "Select the responsible PI"
           : substudies.length > 1 && !substudyLabel
             ? "Select which substudy this patient is enrolled in"
-            : !scheduleGenerated || !scheduleVisits.length
-              ? "Generate the visit schedule to continue"
-              : "Ready to send the patient invitation";
+            : arms.length > 1 && !armLabel
+              ? "Select which arm this patient is enrolled in"
+              : !scheduleGenerated || !scheduleVisits.length
+                ? "Generate the visit schedule to continue"
+                : "Ready to send the patient invitation";
 
   const updateFullName = (raw: string) => {
     const value = sanitizeName(raw);
@@ -268,6 +298,7 @@ export default function AddPatient() {
       const response = await api.post(`/trials/${trialId}/schedule-preview`, {
         baseline_date: toISO(parsedBaseline),
         substudy_label: substudyLabel || undefined,
+        arm_label: armLabel || undefined,
       });
       setScheduleVisits(response.data?.visits || []);
       setScheduleGenerated(true);
@@ -296,6 +327,7 @@ export default function AddPatient() {
         trial_id: trialId,                                  // the SELECTED trial
         pi_id: needsPiSelection ? piId : undefined,
         substudy_label: substudyLabel || undefined,
+        arm_label: armLabel || undefined,
         subject_id: subjectId ? `SUBJ-${subjectId}` : undefined,
         dob: parsedDob ? toISO(parsedDob) : (dob || undefined),
         gender: gender || undefined,
@@ -454,7 +486,7 @@ export default function AddPatient() {
             </Field>
           </FormSection>
 
-          <FormSection icon={<ClipboardList size={18} color={C.primary} />} index="03" title="Study assignment" subtitle="Connect the participant to the right trial and team" active={trialOpen || piOpen || substudyOpen}>
+          <FormSection icon={<ClipboardList size={18} color={C.primary} />} index="03" title="Study assignment" subtitle="Connect the participant to the right trial and team" active={trialOpen || piOpen || substudyOpen || armOpen}>
           <Field label="Assign to Trial *" active={trialOpen}>
             <Pressable testID="trial-toggle" disabled={trialsLoading || !trials.length} onPress={() => setTrialOpen(open => !open)} style={[s.input, s.selectControl]}>
               {trialsLoading ? (
@@ -564,6 +596,39 @@ export default function AddPatient() {
                         // A schedule already previewed under a different (or
                         // no) substudy no longer reflects what will actually
                         // be sent — make the sponsor regenerate it.
+                        setScheduleGenerated(false);
+                        setScheduleVisits([]);
+                      }}
+                      style={s.dropdownRow}
+                    >
+                      <Text style={s.dropdownText}>{label}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              )}
+            </Field>
+          )}
+
+          {arms.length > 1 && (
+            <Field label="Arm *" hint="This trial has arm-specific visit templates — pick the arm this patient is enrolled under." active={armOpen}>
+              <Pressable testID="arm-toggle" onPress={() => setArmOpen(open => !open)} style={[s.input, s.selectControl]}>
+                <Text numberOfLines={1} style={[s.selectText, !armLabel && s.placeholderText]}>
+                  {armLabel || "Select"}
+                </Text>
+                <ChevronRight size={16} color={C.muted} style={{ transform: [{ rotate: armOpen ? "-90deg" : "90deg" }] }} />
+              </Pressable>
+              {armOpen && (
+                <View style={s.dropdown}>
+                  {arms.map(label => (
+                    <Pressable
+                      key={label}
+                      testID={`arm-opt-${label}`}
+                      onPress={() => {
+                        setArmLabel(label);
+                        setArmOpen(false);
+                        // A schedule already previewed under a different (or
+                        // no) arm no longer reflects what will actually be
+                        // sent — make the sponsor regenerate it.
                         setScheduleGenerated(false);
                         setScheduleVisits([]);
                       }}

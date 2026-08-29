@@ -1,11 +1,14 @@
 # Protocol PDF Extraction Pipeline — Technical Demo Notes
 
-Last verified against the implementation: 2026-08-24
+Last verified against the implementation: 2026-08-25
 
-Verification performed for this note: 158 focused offline extraction,
-projection, routing, provider-contract, and pattern-regression tests passed on
-2026-08-24. Database-backed API tests are maintained separately because they
-require a live MongoDB connection.
+Verification performed for this note: the protocol/schedule extraction test
+modules listed in Section 20 pass in full (48 tests directly exercising the
+LangGraph pipeline, plus the broader non-database backend suite with zero
+failures or errors in any protocol/schedule module) on 2026-08-25.
+Database-backed API tests are maintained separately because they require a
+live MongoDB connection, which is not available in this verification
+environment.
 
 ## 1. Executive explanation
 
@@ -16,11 +19,12 @@ My Trial Board converts a clinical-trial protocol PDF into two things:
 
 The important design choice is that the model does **not** directly create the
 saved operational schedule. It first produces page-cited evidence and one rich,
-canonical schedule graph. Server-side code validates that graph, independently
-reconstructs the schedule a second time, compares both reconstructions, audits
-the result against the PDF, optionally repairs it, and deterministically
-projects the graph into the flat rows used by the mobile editor. Those rows are
-still a draft. A sponsor/PI/CRO reviews and explicitly saves them.
+canonical schedule graph. Server-side code validates that graph deterministically
+(evidence-link, structural, and visit-coverage checks that need no model call),
+an AI audit reviews the candidate directly against the attached PDF and those
+deterministic findings, optionally repairs it, and deterministically projects
+the graph into the flat rows used by the mobile editor. Those rows are still a
+draft. A sponsor/PI/CRO reviews and explicitly saves them.
 
 The system is therefore best described as **AI-assisted extraction with
 deterministic compilation and mandatory human review**, not autonomous clinical
@@ -34,8 +38,7 @@ The current `backend/.env` selects:
 |---|---|---|
 | Provider | `gemini` | Google Gemini receives the PDF and returns structured output. |
 | Builder model | `gemini-3.6-flash` | Used for classification, evidence collection, synthesis, audit, and repair. |
-| Confirmation model | No separate override | Confirmation is a fresh reconstruction call using the same model. It is independent in context/output, but it is not a different model or vendor. |
-| Maximum repair passes | `2` | At most two repair → reconfirm → reaudit loops. |
+| Maximum repair passes | `2` | At most two repair → reaudit loops. |
 | Minimum acceptance threshold | `0.75` | Every applicable audit dimension must be marked passed and score at least 0.75. |
 
 Do not claim “95% proven accuracy” during the demo. The code currently uses a
@@ -89,18 +92,16 @@ flowchart TD
     F --> G
     G --> H{Classifier and discovery both say no schedule?}
     H -- Yes --> I[Return empty, explicit no-schedule draft]
-    H -- No --> J[Collect timing evidence]
-    J --> K[Collect visit/activity evidence]
-    K --> L[Builder creates canonical schedule graph]
-    L --> M[Confirmer reconstructs independently]
-    M --> N[Deterministic comparison and evidence checks]
-    N --> O[AI audit scores six dimensions]
-    O --> P{Accepted and no disagreement?}
-    P -- No, repairs remain --> Q[Evidence-backed repair]
-    Q --> M
-    P -- Yes or repair limit --> R[Deterministic projection to editor rows]
-    R --> S[Persist review draft / temporary extraction]
-    S --> T[Human edits, acknowledges, and saves templates]
+    H -- No --> J[Full-document evidence sweep: one call per page chunk]
+    J --> K[Builder creates canonical schedule graph]
+    K --> L[Deterministic evidence-link/structural/coverage checks]
+    L --> M[AI audit re-reads the PDF and scores six dimensions]
+    M --> N{Accepted and no deterministic issue?}
+    N -- No, repairs remain --> O[Evidence-backed repair against PDF + audit findings]
+    O --> L
+    N -- Yes or repair limit --> P[Deterministic projection to editor rows]
+    P --> Q[Persist review draft / temporary extraction]
+    Q --> R[Human edits, acknowledges, and saves templates]
 ```
 
 ## 4. Input and access controls
@@ -132,7 +133,7 @@ flowchart TD
 - Expired/unavailable drafts require the PDF to be uploaded again.
 - Extraction and consumption actions are written to the audit log.
 
-## 5. Deterministic PDF indexing and retrieval
+## 5. Deterministic PDF indexing, retrieval, and full-document chunking
 
 Before the graph runs, `protocol_document_index.py` builds a content-addressed
 page index:
@@ -150,23 +151,34 @@ page index:
    - character count;
    - section markers; and
    - `text`, `sparse_text`, or `image_or_empty` status.
-6. Explicit weighted phrases score pages for five tasks: classification,
-   schedule discovery, timing, activities, and review.
-7. High-scoring pages seed the selection; adjacent pages are included because
-   tables and footnotes often continue across page breaks.
+6. Explicit weighted phrases score pages for classification and schedule
+   discovery — the two stages where a keyword-scored hint is a reasonable,
+   lower-stakes aid.
+7. High-scoring pages seed classification/discovery's selection; adjacent pages
+   are included because tables and footnotes often continue across page breaks.
 8. Pages remain in original document order. The retriever never makes a
    clinical decision.
 
-Current per-stage retrieval budgets are:
+Current classification/discovery retrieval budgets are:
 
 | Stage | Task profile | Maximum pages | Text budget |
 |---|---:|---:|---:|
 | Classification | classification | 14 | 45,000 characters |
 | Discovery | schedule discovery | 24 | 80,000 characters |
-| Timing | timing | 24 | 80,000 characters |
-| Visit/activity evidence | activities | 24 | 80,000 characters |
-| Synthesis/confirmation | review | 28 | 90,000 characters |
-| Audit/repair | review | 24 | 80,000 characters |
+
+**Evidence gathering does not use keyword-scored retrieval.** A protocol's most
+consequential facts — a dose-modification rule stated once in prose, a
+toxicity-triggered visit, a conditional repeat — can live on a page no keyword
+scorer ever ranks highly. Instead, `chunk_protocol_pages()` deterministically
+partitions the whole document into fixed-size page chunks (22 core pages per
+chunk, with a 4-page overlap on each side so a table or rule straddling a
+chunk boundary is still legible), and one worker call runs per chunk in
+parallel. Every chunk's CORE pages are read by construction, so full coverage
+of the document is a structural guarantee, not a hope. Synthesize, audit, and
+repair receive no separately-scored excerpt on top of this — the merged
+evidence pool already covers every page, so a scored excerpt would be
+redundant cost with no coverage benefit (see
+`protocol_agent._STAGES_WITHOUT_RETRIEVAL`).
 
 Each rendered page begins with a citation similar to:
 
@@ -174,10 +186,13 @@ Each rendered page begins with a citation similar to:
 [PDF page 42; evidence_id=page-42-<hash>; text_status=text]
 ```
 
-The retrieved packet is a focus aid, not a hard boundary. With Gemini, the full
-PDF remains available through native PDF input/context caching, so the model is
-explicitly allowed to inspect omitted pages. If indexing fails, extraction
-continues with the attached PDF. A page-index failure is never allowed to turn
+The retrieved packet (for classification/discovery) is a focus aid, not a hard
+boundary. With Gemini, the full PDF remains available through native PDF
+input/context caching, so the model is explicitly allowed to inspect omitted
+pages. If indexing fails, extraction continues with the attached PDF alone —
+every worker chunk instruction says so — and full-document coverage still
+holds because chunking degrades to "read the whole attached PDF directly" in a
+single call rather than failing. A page-index failure is never allowed to turn
 a valid upload into a failed extraction.
 
 If `PROTOCOL_PAGE_INDEX_CACHE_DIR` is configured, page indexes are stored by PDF
@@ -196,7 +211,7 @@ The classifier decides:
   mixed bundle, or unrelated;
 - task: full schedule, amendment comparison, table-only extraction, or no
   schedule;
-- schedule archetypes;
+- schedule archetypes (a first-pass hint only — see below);
 - complexity;
 - whether an attached reference/version comparison exists;
 - protocol/version identifiers when stated; and
@@ -205,6 +220,14 @@ The classifier decides:
 “Independent schedules” means separate Schedule of Assessments tables for
 different substudies/sub-protocols. It does not mean different arms sharing one
 table.
+
+Every later stage receives the full archetype-pattern guidance (crossover,
+cyclic, intra-day, event-driven, multi-arm, factorial, confinement/housing,
+etc.) regardless of what the classifier guessed — the classifier's archetype
+list is framed to every stage as a hint about what to look for, not a gate
+that turns guidance for an unguessed pattern off. This is deliberate: a
+protocol's actual design should be read from the PDF itself, not forced into
+whichever shape classification happened to name first.
 
 ### Multi-schedule routing
 
@@ -216,7 +239,7 @@ For multiple independent schedules:
    timelines;
 2. the shared classification and page index are reused;
 3. one full graph is run for each option;
-4. only that option's table/timing/activity evidence is allowed into its graph;
+4. only that option's evidence is allowed into its graph;
 5. variants run with a bounded concurrency, currently defaulting to three; and
 6. one failed option becomes an empty `needs_review` variant without destroying
    successfully extracted sibling variants.
@@ -248,41 +271,43 @@ and discovery independently say there is no schedule. If only one says no, the
 full extraction continues. This avoids discarding a schedule-only appendix that
 one stage missed.
 
-### Stage 3 — Timing evidence specialist
+### Stage 3 — Full-document evidence sweep
 
-Output: `ScheduleTimingEvidence`.
+Output: merged `ScheduleTimingEvidence` + `ScheduleVisitEvidence`, built from
+one `ScheduleChunkEvidence` response per document chunk.
 
-This stage collects atomic, page-cited facts for:
+Each chunk worker reads its CORE pages (with CONTEXT-only pages shown for
+legibility across chunk boundaries) and returns atomic, page-cited facts —
+never emitting a fact whose evidence is a CONTEXT-only page, since a different
+worker owns that page and would duplicate it. Collected per chunk:
 
-- visit days, weeks, months, years, and hours;
-- visit windows;
-- cycle length, cycle count, and repetition ranges;
-- relative timing;
-- open-ended rules; and
-- conflicts/unknowns.
+- every explicit visit day, week, month, hour, window, cycle length/count,
+  repetition range, relative-time rule, and open-ended cadence;
+- every visit column, including unlabeled numeric columns and wide tables that
+  continue across pages;
+- special/telephonic/unscheduled/safety-follow-up visits;
+- activity/procedure assignments, including population-gated activities
+  (a subgroup-restricted assessment, e.g. by country, age, or reproductive
+  status) captured with the exact gating condition preserved, not flattened;
+- multi-day confinement/housing blocks, where each individually-differentiated
+  day (check-in, pre-dose-only housing days, a dosing/intensive-PK day,
+  check-out) is captured as its own fact when the source differentiates them —
+  never invented when the source states only a plain span;
+- table footnotes and arm/period differences; and
+- conflicts and unknowns, preserved rather than guessed.
 
-Every fact has a unique evidence ID, claim, precise page/table/footnote location,
-short source quote, and confidence. It does not construct the schedule.
+A governing rule stated only in dosing/treatment prose (a cycle length, a
+dose-modification/toxicity-triggered visit, a conditional repeat) is exactly as
+real as one printed in a table cell, and workers are explicitly told to search
+prose, not just tables.
 
-### Stage 4 — Visit/activity evidence specialist
+All chunk results are merged with `evidence_id` values namespaced per chunk
+(`chunk0-`, `chunk1-`, …) so later stages can trace every fact back to the
+worker that produced it. This stage runs in parallel — one call per chunk,
+`asyncio.gather`-ed together — so wall-clock cost is roughly one call's
+latency, not N calls' latency.
 
-Output: `ScheduleVisitEvidence`.
-
-This independently inventories:
-
-- every visit column;
-- screening, baseline, early termination, unscheduled, safety follow-up,
-  telephone, and hourly visits;
-- activities per column;
-- conditional activities and table footnotes; and
-- genuine arm/period differences.
-
-Wide tables receive special treatment: every printed numeric column is a real
-visit even when adjacent columns have identical activities. The stage is told
-to count columns across all continuation pages rather than compressing them to
-representative milestones.
-
-### Stage 5 — Synthesis / builder
+### Stage 4 — Synthesis / builder
 
 Output: `ExtractedSchedule` containing one `canonical_plan`.
 
@@ -302,78 +327,64 @@ empty. The graph can preserve concepts that a flat spreadsheet cannot:
 - evidence links on every populated object.
 
 The builder must leave unsupported values unresolved rather than fill them with
-common clinical defaults.
+common clinical defaults. A timing value only gets `range`/`day_end` when the
+source genuinely states a range; a multi-day confinement block with
+differentiated daily activities gets one event per day instead of being
+collapsed into a start/end span.
 
-### Stage 6 — Independent confirmation
+### Deterministic evidence-link, structural, and coverage checks
 
-The confirmer receives the PDF, classification, document map, and evidence
-packets, but it does not receive the builder's schedule. It reconstructs a
-second canonical schedule independently.
+Before the audit call, plain Python (no model call) checks the single
+candidate schedule:
 
-Current demo nuance: this is a separate generation call, but because no
-confirmation-model override is configured, it uses the same Gemini model as the
-builder. Configuring `GEMINI_PROTOCOL_CONFIRMATION_MODEL` can route it to a
-different Gemini model.
+- **Evidence-link validation** — every timing/window/name/activity value must
+  cite a real, category-correct evidence ID above the confidence threshold;
+  duplicate or unknown evidence IDs are flagged; this runs across the flat
+  projected rows and every canonical anchor, phase, branch, event, activity,
+  timing, window, recurrence, transition, condition, and conflict.
+- **Structural checks** — `schedule_kind=none` with visits (or vice versa),
+  exact duplicate compiled visits, all dated visits collapsing onto one day, a
+  recurring event whose first occurrence cannot be anchored, a
+  recurrence-generated name like `Occurrence 2` that should have been an
+  individually-printed column instead, and a generic `visit_type="visit"` left
+  unclassified.
+- **Visit coverage** — compares the schedule's visit count against how many
+  distinct visit columns the full-document evidence sweep actually inventoried;
+  a schedule with materially fewer visits than inventoried columns is flagged
+  regardless of what the audit concludes on its own.
 
-### Deterministic builder/confirmer comparison
+These checks need no second AI-generated schedule to work — each compares the
+one candidate directly against the evidence catalog gathered by the sweep, so
+they catch a collapsed wide table or a hallucinated citation even when nothing
+else in the pipeline would have noticed.
 
-Before trusting the AI audit, Python compares the two schedules:
+### Stage 5 — Audit
 
-- schedule kind, Day 0/Day 1 convention, and total cycles;
-- flat projected visit signatures: name, type, day/range/hour timing, windows,
-  relative timing, arm, period, and activities;
-- every canonical collection: anchors, phases, branches, activities, events,
-  recurrence, transitions, conditions, and conflicts; and
-- semantic references rather than model-generated IDs, so two equivalent
-  graphs with different internal IDs do not falsely disagree.
+The auditor is the sole review step and is told so explicitly. It sees:
 
-The comparison also checks both outputs against the visit-column inventory.
-If the evidence specialist saw substantially more columns than either schedule
-produced, verification is blocked even when builder and confirmer made the same
-omission.
+- the expanded candidate schedule;
+- the deterministic checks list, framed as confirmed real defects to resolve,
+  not hypotheses to argue away;
+- the full visit/activity evidence packet; and
+- the authoritative PDF itself, attached directly (not a scored excerpt).
 
-### Evidence-link validation
-
-Python checks:
-
-- duplicate and unknown evidence IDs;
-- evidence category correctness (timing evidence must support timing, visit
-  evidence must support names/activities, window evidence must support windows);
-- below-threshold evidence confidence;
-- missing evidence for populated fields; and
-- evidence links across canonical anchors, phases, branches, events,
-  activities, timing, windows, recurrence, transitions, conditions, and
-  conflicts.
-
-### Structural checks
-
-Python flags, among other things:
-
-- `schedule_kind=none` with visits, or a real kind with no visits;
-- exact duplicate compiled visits;
-- all dated visits collapsing to one day;
-- recurring events whose first occurrence cannot be anchored;
-- recurrence-generated names such as `Occurrence 2` where individually printed
-  columns should have been used; and
-- generic `visit_type="visit"` when a meaningful type should have been assigned.
-
-### Stage 7 — Semantic audit
-
-The auditor sees:
-
-- expanded builder schedule;
-- expanded confirmation schedule;
-- deterministic disagreement list;
-- original visit/activity evidence inventory; and
-- the authoritative PDF.
-
-It independently scores six dimensions:
+It is instructed to re-read the PDF's own Schedule of Assessments/Activities
+section column by column, row by row — confirming each visit has a matching
+entry with the right day/window/procedures — rather than sampling a few rows
+and extrapolating. It independently scores six dimensions:
 
 1. visit coverage;
-2. timing;
+2. timing (including, for a crossover/BA-BE design, whether each period's
+   sequence branch keeps it distinguishable from the same-numbered period in
+   another sequence, whether intra-day PK timepoints anchor to their own
+   period's dosing event, and whether a multi-day confinement block was wrongly
+   compressed into one ranged event instead of one event per differentiated
+   day);
 3. visit windows;
 4. visit types;
-5. procedure mapping; and
+5. procedure mapping (including, for a factorial design, whether factor-scoped
+   activities are correctly gated rather than missing or leaking across arms);
+   and
 6. overall end-to-end schedule.
 
 For acceptance:
@@ -381,29 +392,36 @@ For acceptance:
 - the audit must set `approved=true`;
 - every applicable dimension must be marked passed;
 - every applicable dimension must score at least the configured threshold;
-- no critical or major issue may remain;
-- builder/confirmer deterministic disagreements must be empty; and
-- deterministic projection/validation must not require review.
+- no critical or major issue may remain; and
+- the deterministic checks list must be empty.
 
 One strong dimension cannot compensate for a weak one. For example, excellent
-procedure mapping cannot hide an incomplete visit schedule.
+procedure mapping cannot hide an incomplete visit schedule. The deterministic
+checks are a hard gate the audit's own opinion cannot override — they are
+objectively-detectable defects (a missing citation, a dropped column), not a
+matter of judgment — while everything else routes through the audit's scored,
+PDF-grounded review.
 
-### Stage 8 — Bounded repair loop
+### Stage 6 — Bounded repair loop
 
-If the audit is not accepted or deterministic disagreements remain:
+If the audit is not accepted or the deterministic checks are not empty:
 
-1. repair receives the full candidate, independent reconstruction,
-   deterministic disagreements, audit findings, evidence inventory, and PDF;
-2. it returns a complete replacement canonical schedule using the smallest
-   evidence-supported corrections;
-3. confirmation is rerun from scratch;
-4. deterministic comparison is rerun;
-5. audit is rerun; and
-6. the process stops when accepted or after the configured maximum repairs.
+1. repair receives the full candidate, the deterministic checks, audit
+   findings, evidence inventory, and the PDF;
+2. it re-reads the PDF, especially every location the audit cited, and returns
+   a complete replacement canonical schedule using the smallest evidence-backed
+   correction — never accepting an audit claim that conflicts with the PDF;
+3. the deterministic checks are rerun on the repaired candidate;
+4. audit is rerun; and
+5. the process stops when accepted or after the configured maximum repairs.
 
-With the current `max_refinements=2`, a single-schedule happy path uses seven
-main model stages. A fully exercised repair path uses up to thirteen main stage
-calls: seven initial calls plus two repair/confirm/audit rounds.
+With the current `max_refinements=2`, a single-schedule happy path costs
+classify + discover + one evidence-sweep call per document chunk + synthesize
++ audit — for a 100-page protocol (≈5 chunks), roughly 9 calls. A fully
+exercised repair path adds up to two more repair/audit rounds (2 calls each),
+for roughly 13 calls total. There is no separate confirmation stage any more —
+the audit is the only AI review pass, backed by the deterministic checks
+above.
 
 ### Stage retries and checkpointing
 
@@ -418,8 +436,8 @@ calls: seven initial calls plus two repair/confirm/audit rounds.
   the extraction endpoint.
 - Ollama has separate durable per-PDF page-batch checkpoints on disk.
 
-If confirmation, audit, or repair ultimately fails, the system retains the last
-valid candidate and returns `needs_review`; it does not mark an unchecked draft
+If audit or repair ultimately fails, the system retains the last valid
+candidate and returns `needs_review`; it does not mark an unchecked draft
 verified.
 
 ## 7. Canonical schedule schema
@@ -553,6 +571,10 @@ The server performs the date arithmetic.
 - Period branches are nested under sequences.
 - PK events attach to their own period's dose anchor.
 - Washout is represented as a transition/minimum gap, not a fabricated visit.
+- A multi-day confinement/housing block inside one period (check-in, pre-dose
+  housing days, a dosing/intensive-PK day, check-out) becomes one event per
+  differentiated day rather than a single ranged event, whenever the source
+  differentiates the days' activities.
 - The design generalizes beyond 2×2 to three or more periods/sequences.
 
 ### Factorial
@@ -631,7 +653,8 @@ The API returns:
 - refinement count;
 - issues;
 - per-dimension accuracy scores; and
-- independent confirmation score.
+- a deterministic-checks score (`1.0` if the evidence-link/structural/coverage
+  checks found nothing, `0.0` otherwise).
 
 The frontend shows:
 
@@ -703,7 +726,13 @@ past instances are protected by the normal scheduling workflow.
   fields.
 - Malformed/empty/truncated structured output receives one immediate retry.
 - For PDFs of at least 100 KB, attempts a Gemini context cache so the PDF is
-  uploaded once and referenced by the 7–13 stage calls.
+  uploaded once and referenced by every one of the roughly 9–13 stage calls.
+  Because the Gemini API rejects `system_instruction` alongside
+  `cached_content`, each stage's system prompt is folded into that call's own
+  content instead of the request config when a cache is active — the shared
+  cache still only ever holds the (large) PDF, so every stage keeps referencing
+  it regardless of which of the five distinct system prompts (classify,
+  discover, evidence-sweep, synthesize/repair, audit) that call uses.
 - Default cache TTL is 30 minutes.
 - Cache creation/use failure falls back to attaching the full PDF per call and
   never fails extraction by itself.
@@ -747,7 +776,6 @@ past instances are protected by the normal scheduling workflow.
 | Page indexing/retrieval failure | Logged; full-PDF extraction continues. |
 | Scanned/image page | Flagged as requiring vision/OCR; Gemini still has the native PDF. |
 | Malformed stage output | Retry only that stage; completed upstream stages remain reusable. |
-| Confirmation failure | Keep candidate, force `needs_review`. |
 | Audit failure | Return unchecked review draft; never mark verified. |
 | Repair failure | Keep last valid candidate and force review. |
 | Repair limit reached | Return `needs_review` with unresolved issues. |
@@ -784,8 +812,11 @@ past instances are protected by the normal scheduling workflow.
 3. **Point out one analysis:** metadata and schedule come from the same Gemini
    workflow; the schedule is cached for two hours so the next screen does not
    rerun AI.
-4. **While extraction runs, explain the seven-stage happy path:** classify,
-   discover, timing evidence, visit evidence, build, confirm, audit.
+4. **While extraction runs, explain the pipeline:** classify, discover, a
+   full-document evidence sweep (one call per page chunk, reading every page
+   of the PDF by construction), build, and audit — with deterministic
+   evidence-link/structural/coverage checks run in code before the audit ever
+   sees the schedule.
 5. **Show the Visit Schedule screen:** visit count, exact protocol labels,
    offsets/windows, clinical/admin tasks, constraints, and the verified/review
    badge.
@@ -808,16 +839,17 @@ Use the PICN-style problem:
 > “The appendix may print nine columns, but the actual schedule can be roughly
 > 25 visits. The cycle length is on one page, the repetition rule on another,
 > and cycle-specific imaging in several sections. A table-only OCR solution can
-> be wrong while looking plausible. This pipeline separates evidence gathering,
-> schedule construction, deterministic arithmetic, and independent review.”
+> be wrong while looking plausible. This pipeline separates evidence gathering
+> (reading every page of the document, not just the table), schedule
+> construction, deterministic arithmetic, and a PDF-grounded audit.”
 
 ## 17. Likely technical questions and answers
 
 ### “Is this just one prompt?”
 
 No. Gemini follows a bounded LangGraph workflow with specialized
-classification, discovery, timing, activity, synthesis, independent
-confirmation, audit, and optional repair stages.
+classification, discovery, full-document evidence sweep, synthesis, audit, and
+optional repair stages.
 
 ### “Why not ask the model for final rows?”
 
@@ -827,28 +859,42 @@ model declares protocol structure; Python expands and validates it repeatably.
 ### “How do you prevent hallucinated windows?”
 
 Missing windows have an explicit `not_stated` state, every populated window
-requires window-category evidence, builder/confirmer outputs are compared, and
-the audit scores windows independently. No default tolerance is injected.
+requires window-category evidence checked deterministically against the
+evidence catalog, and the audit scores windows independently while re-reading
+the PDF itself. No default tolerance is injected.
 
-### “What makes confirmation independent?”
+### “Why was the independent-confirmation stage removed?”
 
-The confirmer reconstructs from the PDF and evidence without seeing the
-builder output. In the current environment it is a separate call to the same
-model; a different confirmation model can be configured. The subsequent
-comparison is deterministic Python.
+An earlier design generated a second, independently-reconstructed schedule and
+diffed it against the builder's schedule as part of the review gate. In
+practice this produced a lot of false-positive "disagreement" between two
+correct-but-differently-phrased schedules (different internal IDs, different
+but equally valid structuring choices for ambiguous cases), which forced extra
+repair rounds and could keep a genuinely accurate schedule stuck on
+`needs_review` even when the AI audit itself was satisfied. It also cost a
+full extra generation call every round. The replacement keeps the parts of
+that mechanism that were actually reliable — evidence-link validation,
+structural checks, and visit-coverage-vs-evidence-catalog checks, all pure
+Python — and drops the noisy two-schedule diff. The audit is now the sole AI
+review pass, explicitly instructed to re-verify the schedule against the PDF
+itself rather than relying on a second guess to contrast against.
 
-### “Can two models make the same mistake?”
+### “Can the model still make a mistake the checks don't catch?”
 
-Yes. That is why the system also compares visit counts to the independently
-collected column inventory, validates evidence links/categories, performs
-structural checks, and still requires a human review. This reduces risk; it
-does not mathematically eliminate it.
+Yes. The deterministic checks catch objectively-detectable defects (missing
+citations, dropped columns, malformed structure); they cannot catch a
+plausible-looking but factually wrong day offset that cites real evidence.
+That is why the audit is instructed to re-read the PDF's Schedule of
+Assessments section column by column rather than merely reviewing the
+schedule's internal consistency, and why a human review step remains mandatory
+regardless of `verified` status.
 
 ### “What does verified mean?”
 
-It means the automated draft passed all configured audit dimensions,
-builder/confirmer comparison, evidence checks, and deterministic validation.
-It does not mean regulatory approval or proven ground-truth accuracy.
+It means the automated draft passed all configured audit dimensions and every
+deterministic check (evidence links, structural validity, visit coverage
+against the evidence catalog). It does not mean regulatory approval or proven
+ground-truth accuracy.
 
 ### “How are scans handled?”
 
@@ -888,29 +934,32 @@ a manually labeled real-PDF evaluation set and must be reported separately.
 
 1. Real-PDF ground-truth accuracy across the supplied corpus has not yet been
    established for the current design.
-2. Builder and confirmer currently use the same model unless a separate Gemini
-   confirmation model is configured.
-3. Model-reported audit scores are not calibrated clinical accuracy estimates.
-4. Heavily degraded scans or unusually structured tables can still require
+2. Model-reported audit scores are not calibrated clinical accuracy estimates.
+3. Heavily degraded scans or unusually structured tables can still require
    manual reconstruction.
-5. Claude, OpenRouter, and Ollama paths are legacy single-shot providers and do
+4. Claude, OpenRouter, and Ollama paths are legacy single-shot providers and do
    not provide the same decomposed multi-schedule workflow as Gemini.
-6. Add Trial validates PDF MIME/name but does not currently perform the `%PDF-`
+5. Add Trial validates PDF MIME/name but does not currently perform the `%PDF-`
    magic-byte check used by the existing-trial extraction route.
-7. The graph checkpoint mechanism is not durably persisted by the current
+6. The graph checkpoint mechanism is not durably persisted by the current
    Gemini API endpoint; an application process restart can lose in-flight stage
    progress. Ollama page-batch checkpoints are durable.
-8. The frontend permits a reviewer to confirm-save with pending rows; this is a
+7. The frontend permits a reviewer to confirm-save with pending rows; this is a
    deliberate human override, not a claim that every flag was resolved.
+8. There is no longer a second, independently-generated schedule to catch a
+   mistake the deterministic checks and the single audit pass both miss. This
+   is a deliberate cost/noise tradeoff (see Section 17), not an oversight, but
+   it does mean the audit's own PDF-grounded review carries more weight than it
+   used to.
 
 ## 19. Implementation map
 
 | Component | File |
 |---|---|
 | API upload, temporary handoff, draft persistence, editor payload | `backend/server.py` |
-| Provider selection, Gemini/Claude/OpenRouter/Ollama, deterministic expansion | `backend/protocol_extraction.py` |
-| LangGraph stages, prompts, confirmation, audit, repair, retries | `backend/protocol_agent.py` |
-| PDF hashing, page text index, retrieval and page citations | `backend/protocol_document_index.py` |
+| Provider selection, Gemini/Claude/OpenRouter/Ollama, deterministic expansion, PDF context caching | `backend/protocol_extraction.py` |
+| LangGraph stages, prompts, evidence-sweep merge, deterministic checks, audit, repair, retries | `backend/protocol_agent.py` |
+| PDF hashing, page text index, retrieval, page chunking for the evidence sweep, page citations | `backend/protocol_document_index.py` |
 | Canonical v2 schema, validation, temporal/calendar math, row projection | `backend/schedule_schema.py` |
 | Add Trial upload and metadata prefill | `frontend/app/(app)/sponsor/add-trial.tsx` |
 | Schedule consumption, variants, review UI, saving | `frontend/app/(app)/sponsor/visit-schedule.tsx` |
@@ -921,12 +970,13 @@ a manually labeled real-PDF evaluation set and must be reported separately.
 The repository contains focused tests for:
 
 - page-index stability, scanned-page reporting, task retrieval, adjacent
-  footnotes, budgets, caching, corrupt cache recovery, and invalid PDFs;
+  footnotes, budgets, caching, corrupt cache recovery, invalid PDFs, and
+  full-document page chunking for the evidence sweep;
 - no-schedule routing, classification guidance, retrieval fallback, mismatched
   PDF index rejection, and multi-schedule selection/fan-out;
-- repair and reaudit, bounded failure, unavailable confirmation/audit/repair,
-  per-dimension gating, same-error builder/confirmer protection, evidence
-  confidence/categories, and checkpoint resume;
+- repair and reaudit, bounded failure, an unavailable audit/repair stage,
+  per-dimension gating, evidence-link/structural/coverage checks against the
+  single candidate, evidence confidence/categories, and checkpoint resume;
 - Day 0/Day 1 arithmetic, negative screening, ranges, Hour 26, cyclic expansion,
   cadence changes, conditional procedures, relative chains/cycles, duplicate
   handling, chronological sorting, and runaway caps;
@@ -959,11 +1009,12 @@ backend/tests/test_protocol_creation.py
 ## 21. One-minute closing summary
 
 > “The application does not treat protocol extraction as PDF-to-JSON in one
-> shot. It first identifies the document and schedule type, retrieves relevant
-> pages, extracts atomic timing and visit evidence, builds one canonical
-> evidence-backed graph, independently reconstructs it, compares both outputs
-> with deterministic code, audits six accuracy dimensions, repairs within a
-> strict bound, and compiles the result into mobile-friendly visits. Unknowns,
+> shot. It first identifies the document and schedule type, sweeps the entire
+> document in parallel page-chunked passes for atomic timing and visit
+> evidence, builds one canonical evidence-backed graph, checks it
+> deterministically against that evidence catalog, audits six accuracy
+> dimensions by re-reading the source PDF directly, repairs within a strict
+> bound, and compiles the result into mobile-friendly visits. Unknowns,
 > conflicts, open-ended schedules, and provider failures fail toward human
 > review. Only after a user reviews and saves does the draft become an
 > operational visit template.”

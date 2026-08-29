@@ -34,3 +34,6 @@ anthropic>=0.69.0
 ollama>=0.6.0
 pypdfium2>=4.30.0
 langgraph>=1.1.6,<1.2
+SQLAlchemy>=2.0,<2.1
+alembic>=1.13,<2
+psycopg[binary]>=3.2,<4

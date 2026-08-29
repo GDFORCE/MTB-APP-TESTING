@@ -262,7 +262,15 @@ class SchedulePhase(BaseModel):
 class ScheduleBranch(BaseModel):
     id: str
     name: str
-    branch_type: Literal["arm", "cohort", "period", "sequence"]
+    branch_type: str = Field(
+        description="Kind of grouping this branch represents. Use the protocol's own "
+        "term when it doesn't fit these common cases: 'arm' (a treatment arm/cohort "
+        "distinguished by drug or dose), 'period' (a period/phase within a crossover "
+        "or multi-phase design), 'sequence' (a randomized treatment order in a "
+        "crossover), 'cohort' (a dose-escalation or expansion cohort). Free text is "
+        "fine for a structure that doesn't match these, e.g. 'dose_level' or "
+        "'sub_study' — never force a genuinely different grouping into one of these "
+        "labels.")
     parent_branch_id: str | None = None
     evidence_ids: list[str] = Field(default_factory=list)
 
@@ -337,7 +345,12 @@ class TransitionRule(BaseModel):
     id: str
     from_event_id: str
     to_event_id: str
-    relation: Literal["before", "after", "same_day", "minimum_gap", "maximum_gap"]
+    relation: str = Field(
+        description="How these two events relate, in the protocol's own terms when "
+        "the common cases don't fit: 'before', 'after', 'same_day', 'minimum_gap', "
+        "'maximum_gap'. Free text is fine, e.g. 'concurrent with' or 'no sooner "
+        "than' — this field is descriptive only, never invent a category that "
+        "misstates what the protocol says.")
     amount: TemporalAmount | None = None
     evidence_ids: list[str] = Field(default_factory=list)
 
@@ -729,16 +742,153 @@ def _calendar_elapsed_days(amount: TemporalAmount | None) -> float | None:
     return amount.value * factor if factor is not None else None
 
 
+# ─────────────────── printed "Day N" label <-> offset conversion ───────────────────
+# Deterministic, no network, no API key. Shared by both schedule shapes: the legacy
+# flat-visits path (normalize_extracted_timing in protocol_extraction.py) and the
+# canonical_plan path (build_row below) both cross-check a resolved day_offset/day_end
+# against the exact day number(s) printed in the event's own source_label, and correct
+# it when they disagree instead of trusting whatever arithmetic the model did in its
+# head. A schedule's own printed day numbers are ground truth; a computed offset is not.
+
+_SIMPLE_DAY_LABEL = re.compile(r"^\s*day\s*([+-]?\d+)\s*$", re.IGNORECASE)
+_SIMPLE_DAY_RANGE_LABEL = re.compile(
+    r"^\s*days?\s*([+-]?\d+)\s*(?:-|–|—|to)\s*(?:day\s*)?([+-]?\d+)\s*$",
+    re.IGNORECASE,
+)
+# A short list/enumeration of specific days for one activity — "Day 12, 13 and 14",
+# "Days 12, 13, 14", "day 12, 13 and day 14" — the shape a multi-day confinement/
+# housing block's shared pre-dose or PK-sampling event is commonly labeled with. The
+# shape check first confirms the ENTIRE label is built only from digits, day/days,
+# and separator words (so free prose is never mistaken for a day list), then the
+# individual numbers are pulled out separately with a plain (unsigned) \d+ — using a
+# signed pattern here would let a plain range dash ("12-14") get misread as a
+# negative number ("-14") on this fallback path, which the dedicated range regex
+# above already handles correctly for exactly that shape.
+_DAY_LIST_TOKEN = r"(?:\d+|days?|and|&|,|-|–|—|to)"
+_SIMPLE_DAY_LIST_SHAPE = re.compile(
+    r"^(?:\s*" + _DAY_LIST_TOKEN + r")+\s*$", re.IGNORECASE)
+_MIN_DAY_LIST_ITEMS = 2
+_MAX_DAY_LIST_ITEMS = 10
+
+
+def study_day_to_offset(
+    study_day: int,
+    *,
+    anchor_study_day: int,
+    includes_day_zero: bool | None,
+) -> int:
+    """Convert one printed ``Day N`` into the canonical calendar offset.
+
+    Day-numbering conventions skip zero only when the anchor is Day 1 and the
+    protocol explicitly has no Day 0. A printed Day 0 is invalid in that
+    convention instead of being silently moved to the baseline date.
+    """
+    if anchor_study_day not in (0, 1):
+        raise ValueError("anchor_study_day must be 0 or 1")
+    if anchor_study_day == 0:
+        if includes_day_zero is False:
+            raise ValueError("A Day 0 anchor requires includes_day_zero=true")
+        return int(study_day)
+    if study_day >= 1:
+        return int(study_day) - 1
+    if includes_day_zero is None:
+        raise ValueError(
+            "includes_day_zero is required for Day 0 or negative Day labels")
+    if includes_day_zero:
+        return int(study_day) - 1
+    if study_day == 0:
+        raise ValueError("Day 0 is invalid when the protocol excludes Day 0")
+    # In a Day-1/no-Day-0 sequence, Day -1 is the prior calendar day while
+    # positive labels are one-based (Day 1 is offset zero).
+    return int(study_day) - 1 if study_day >= 1 else int(study_day)
+
+
+def simple_day_label_offset(
+    source_day_label: str | None,
+    *,
+    anchor_study_day: int | None,
+    includes_day_zero: bool | None,
+) -> int | None:
+    """Convert only an exact ``Day N`` label when convention metadata is known.
+
+    Cycle labels, Week 1, ranges, and prose stay untouched because converting
+    them requires protocol-specific evidence. ``None`` means "do not infer".
+    """
+    if anchor_study_day is None:
+        return None
+    match = _SIMPLE_DAY_LABEL.fullmatch(str(source_day_label or ""))
+    if not match:
+        return None
+    study_day = int(match.group(1))
+    if anchor_study_day == 1 and includes_day_zero is None and study_day <= 0:
+        return None
+    return study_day_to_offset(
+        study_day,
+        anchor_study_day=anchor_study_day,
+        includes_day_zero=includes_day_zero,
+    )
+
+
+def simple_day_label_range_offsets(
+    source_day_label: str | None,
+    *,
+    anchor_study_day: int | None,
+    includes_day_zero: bool | None,
+) -> tuple[int, int] | None:
+    """Convert an exact ``Day A-B``/``Day A to Day B`` or ``Day A, B and C``
+    source label into (start, end) offsets spanning its lowest/highest day.
+
+    Only a label built entirely from digits and day/range vocabulary is
+    accepted — anything else (prose, an unrelated number) is left alone.
+    """
+    if anchor_study_day is None:
+        return None
+    label = str(source_day_label or "")
+    match = _SIMPLE_DAY_RANGE_LABEL.fullmatch(label)
+    if match:
+        numbers = [int(match.group(1)), int(match.group(2))]
+    elif _SIMPLE_DAY_LIST_SHAPE.fullmatch(label) and re.search(
+            r"days?", label, re.IGNORECASE):
+        numbers = [int(value) for value in re.findall(r"\d+", label)]
+        if not (_MIN_DAY_LIST_ITEMS <= len(numbers) <= _MAX_DAY_LIST_ITEMS):
+            return None
+    else:
+        return None
+    start_day, end_day = min(numbers), max(numbers)
+    if (anchor_study_day == 1 and includes_day_zero is None
+            and (start_day <= 0 or end_day <= 0)):
+        return None
+    start = study_day_to_offset(
+        start_day, anchor_study_day=anchor_study_day,
+        includes_day_zero=includes_day_zero)
+    end = study_day_to_offset(
+        end_day, anchor_study_day=anchor_study_day,
+        includes_day_zero=includes_day_zero)
+    if end < start:
+        raise ValueError("day range ends before it starts")
+    return start, end
+
+
 def project_canonical_plan(
     plan: CanonicalSchedulePlan,
     *,
     open_ended_preview_count: int = 12,
+    anchor_study_day: int | None = None,
+    includes_day_zero: bool | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Compile one canonical graph into the legacy/mobile visit-row contract.
 
     Calendar months/years and event-driven timing remain undated in the template
     while their exact source timing is retained.  They are resolved only after a
     patient-specific anchor date exists.
+
+    ``anchor_study_day``/``includes_day_zero`` are the protocol's own Day 0/Day 1
+    numbering convention (see ``ExtractedSchedule``). When supplied, every
+    resolved ``day_offset``/``day_end`` is cross-checked against the day
+    number(s) printed in the event's own ``source_label`` and corrected if they
+    disagree — the model's own printed day text is ground truth, a computed
+    offset is not. Omitted (``None``) only for callers that never had this
+    metadata; the cross-check then simply never fires, matching prior behavior.
     """
     warnings: list[str] = []
     anchor_ids = {item.id for item in plan.anchors}
@@ -1071,6 +1221,44 @@ def project_canonical_plan(
             if start is not None and end is not None and baseline_anchor_id == timing.anchor_id:
                 day_offset = int(start) if float(start).is_integer() else None
                 day_end = int(end) if float(end).is_integer() else None
+
+        # Cross-check the resolved day_offset/day_end against the day number(s)
+        # actually printed in this event's own source_label — the same
+        # protection normalize_extracted_timing gives the legacy flat-visits
+        # path, applied here so the canonical_plan path (the one every real AI
+        # extraction now uses) gets it too. Restricted to events ultimately
+        # dated straight off the study baseline: a protocol that restarts "Day
+        # 1" locally within each period/cycle would make the global
+        # anchor_study_day/includes_day_zero convention meaningless for a
+        # non-baseline-anchored event, so this only fires where it is safe to
+        # trust the label at face value.
+        if anchor_study_day is not None and effective_anchor_id(event) == baseline_anchor_id:
+            try:
+                derived_range = simple_day_label_range_offsets(
+                    source_label, anchor_study_day=anchor_study_day,
+                    includes_day_zero=includes_day_zero)
+                derived_single = None if derived_range is not None else simple_day_label_offset(
+                    source_label, anchor_study_day=anchor_study_day,
+                    includes_day_zero=includes_day_zero)
+            except ValueError as exc:
+                warnings.append(
+                    f"'{event.name}' has invalid day numbering in '{source_label}': "
+                    f"{exc}.")
+                day_offset = day_end = None
+            else:
+                if derived_range is not None:
+                    derived_start, derived_end = derived_range
+                    if (day_offset, day_end) != (derived_start, derived_end):
+                        warnings.append(
+                            f"'{event.name}' timing was corrected deterministically "
+                            f"from '{source_label}' and flagged for review.")
+                    day_offset, day_end = derived_start, derived_end
+                elif derived_single is not None and day_offset != derived_single:
+                    if day_offset is not None:
+                        warnings.append(
+                            f"'{event.name}' timing was corrected deterministically "
+                            f"from '{source_label}' and flagged for review.")
+                    day_offset = derived_single
 
         early = event.window.early
         late = event.window.late

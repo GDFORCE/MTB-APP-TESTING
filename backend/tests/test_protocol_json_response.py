@@ -126,6 +126,9 @@ def test_json_extractor_does_not_retry_valid_schedule_with_null_windows():
 
 
 def test_gemini_extractor_uses_native_pdf_and_structured_response():
+    # evidence_ids below are prefixed "chunk0-" to match what
+    # evidence_sweep_node's merge actually produces: the single chunk this
+    # test exercises (no page index for a fake PDF) is always chunk index 0.
     payload = {
         "schedule_kind": "linear",
         "anchor_study_day": 1,
@@ -134,11 +137,11 @@ def test_gemini_extractor_uses_native_pdf_and_structured_response():
                 "anchors": [{
                     "id": "anchor-baseline", "name": "Baseline",
                     "anchor_type": "first_dose",
-                    "evidence_ids": ["timing-p12-01"],
+                    "evidence_ids": ["chunk0-timing-p12-01"],
                 }],
             "activities": [{
                 "id": "activity-consent", "name": "Informed consent",
-                "evidence_ids": ["activity-p12-01"],
+                "evidence_ids": ["chunk0-activity-p12-01"],
             }],
             "events": [{
                 "id": "event-screening", "name": "Screening",
@@ -147,17 +150,17 @@ def test_gemini_extractor_uses_native_pdf_and_structured_response():
                     "kind": "offset", "anchor_id": "anchor-baseline",
                     "offset": {"value": -14, "unit": "day"},
                     "source_label": "Day -14",
-                    "evidence_ids": ["timing-p12-01"],
+                    "evidence_ids": ["chunk0-timing-p12-01"],
                 },
                 "window": {
                     "state": "stated",
                     "early": {"value": 3, "unit": "day"},
                     "late": {"value": 3, "unit": "day"},
                     "source_label": "±3 days",
-                    "evidence_ids": ["window-p12-01"],
+                    "evidence_ids": ["chunk0-window-p12-01"],
                 },
                 "activity_ids": ["activity-consent"],
-                "evidence_ids": ["visit-p12-01"],
+                "evidence_ids": ["chunk0-visit-p12-01"],
             }],
         },
         "assumptions": [],
@@ -192,7 +195,7 @@ def test_gemini_extractor_uses_native_pdf_and_structured_response():
                     "baseline_anchor": "Day 1",
                     "notes": [],
                 })
-            if schema_name == "ScheduleTimingEvidence":
+            if schema_name == "ScheduleChunkEvidence":
                 return SimpleNamespace(parsed={
                     "visit_timing": [{
                         "evidence_id": "timing-p12-01",
@@ -211,10 +214,6 @@ def test_gemini_extractor_uses_native_pdf_and_structured_response():
                     "cycle_rules": [],
                     "relative_timing": [],
                     "open_ended_rules": [],
-                    "conflicts_or_unknowns": [],
-                })
-            if schema_name == "ScheduleVisitEvidence":
-                return SimpleNamespace(parsed={
                     "visit_columns": [{
                         "evidence_id": "visit-p12-01",
                         "claim": "Screening visit",
@@ -277,16 +276,16 @@ def test_gemini_extractor_uses_native_pdf_and_structured_response():
 
     schedule = asyncio.run(extractor.extract(b"%PDF-test"))
 
-    assert len(async_client.models.calls) == 7
+    assert len(async_client.models.calls) == 5
     call = async_client.models.calls[0]
     assert call["model"] == "gemini-3.6-flash"
     assert call["contents"][0]["mime_type"] == "application/pdf"
     assert [item["config"]["response_schema"].__name__
             for item in async_client.models.calls] == [
-        "DocumentTaskClassification", "ScheduleDocumentMap", "ScheduleTimingEvidence", "ScheduleVisitEvidence",
-        "CanonicalScheduleResponse", "CanonicalScheduleResponse", "ScheduleAudit",
+        "DocumentTaskClassification", "ScheduleDocumentMap", "ScheduleChunkEvidence",
+        "CanonicalScheduleResponse", "ScheduleAudit",
     ]
-    assert async_client.models.calls[4]["config"]["response_schema"] is CanonicalScheduleResponse
+    assert async_client.models.calls[3]["config"]["response_schema"] is CanonicalScheduleResponse
     assert "additionalProperties" not in json.dumps(CanonicalScheduleResponse.model_json_schema())
     assert_gemini_compatible_enums(CanonicalScheduleResponse.model_json_schema())
     assert schedule.visits[0].name == "Screening"
@@ -370,11 +369,11 @@ def test_gemini_extractor_reuses_one_pdf_cache_across_all_stage_calls():
             "anchors": [{
                 "id": "anchor-baseline", "name": "Baseline",
                 "anchor_type": "first_dose",
-                "evidence_ids": ["timing-p12-01"],
+                "evidence_ids": ["chunk0-timing-p12-01"],
             }],
             "activities": [{
                 "id": "activity-consent", "name": "Informed consent",
-                "evidence_ids": ["activity-p12-01"],
+                "evidence_ids": ["chunk0-activity-p12-01"],
             }],
             "events": [{
                 "id": "event-screening", "name": "Screening",
@@ -383,17 +382,17 @@ def test_gemini_extractor_reuses_one_pdf_cache_across_all_stage_calls():
                     "kind": "offset", "anchor_id": "anchor-baseline",
                     "offset": {"value": -14, "unit": "day"},
                     "source_label": "Day -14",
-                    "evidence_ids": ["timing-p12-01"],
+                    "evidence_ids": ["chunk0-timing-p12-01"],
                 },
                 "window": {
                     "state": "stated",
                     "early": {"value": 3, "unit": "day"},
                     "late": {"value": 3, "unit": "day"},
                     "source_label": "±3 days",
-                    "evidence_ids": ["window-p12-01"],
+                    "evidence_ids": ["chunk0-window-p12-01"],
                 },
                 "activity_ids": ["activity-consent"],
-                "evidence_ids": ["visit-p12-01"],
+                "evidence_ids": ["chunk0-visit-p12-01"],
             }],
         },
         "assumptions": [],
@@ -433,7 +432,7 @@ def test_gemini_extractor_reuses_one_pdf_cache_across_all_stage_calls():
         "schedule_locations": [], "supporting_locations": [],
         "arms_and_periods": [], "baseline_anchor": "Day 1", "notes": [],
     }
-    timing_evidence_payload = {
+    chunk_evidence_payload = {
         "visit_timing": [{
             "evidence_id": "timing-p12-01",
             "claim": "Screening Day -14",
@@ -449,9 +448,6 @@ def test_gemini_extractor_reuses_one_pdf_cache_across_all_stage_calls():
             "confidence": 0.99,
         }],
         "cycle_rules": [], "relative_timing": [], "open_ended_rules": [],
-        "conflicts_or_unknowns": [],
-    }
-    visit_evidence_payload = {
         "visit_columns": [{
             "evidence_id": "visit-p12-01",
             "claim": "Screening visit",
@@ -480,8 +476,7 @@ def test_gemini_extractor_reuses_one_pdf_cache_across_all_stage_calls():
             payload = {
                 "DocumentTaskClassification": classification_payload,
                 "ScheduleDocumentMap": document_map_payload,
-                "ScheduleTimingEvidence": timing_evidence_payload,
-                "ScheduleVisitEvidence": visit_evidence_payload,
+                "ScheduleChunkEvidence": chunk_evidence_payload,
                 "CanonicalScheduleResponse": valid_payload,
                 "ScheduleAudit": audit_payload,
             }[schema_name]
@@ -527,11 +522,21 @@ def test_gemini_extractor_reuses_one_pdf_cache_across_all_stage_calls():
     assert len(async_client.caches.created) == 1
     assert async_client.caches.created[0]["config"]["contents"][0]["data"] == big_pdf
     # Every stage call referenced the cache instead of attaching the PDF.
-    assert len(async_client.models.calls) == 7
+    assert len(async_client.models.calls) == 5
     for call in async_client.models.calls:
         assert call["config"].get("cached_content") == "cachedContents/fake-cache-1"
         assert not any(
             isinstance(part, dict) and part.get("mime_type") == "application/pdf"
+            for part in call["contents"])
+        # The real Gemini API rejects a request that sets both cached_content
+        # and system_instruction ("CachedContent can not be used with ...
+        # system_instruction"). This mock doesn't enforce that, so assert the
+        # invariant directly: no cached call may carry system_instruction,
+        # and its guidance must instead be folded into the call's contents
+        # (every stage system prompt in this codebase opens with "You are").
+        assert "system_instruction" not in call["config"]
+        assert any(
+            isinstance(part, str) and "You are" in part
             for part in call["contents"])
     # Cleaned up after the extraction finished.
     assert async_client.caches.deleted == [{"name": "cachedContents/fake-cache-1"}]

@@ -306,3 +306,64 @@ def test_expand_schedule_uses_canonical_plan_not_conflicting_ai_flat_rows():
 
     assert [(item.name, item.day_offset) for item in expanded.visits] == [
         ("Canonical Baseline", 0)]
+
+
+def _housing_plan(range_start_day: float, range_end_day: float) -> CanonicalSchedulePlan:
+    """A single multi-day pre-dose event shaped like CT25-007's own Visit 2:
+    check-in on Day 11, then a shared pre-dose-sample event spanning Days
+    12-14 (see protocol_extraction 'MULTI-DAY CONFINEMENT/HOUSING' pattern).
+    range_start_day/range_end_day are the (possibly wrong) elapsed-day values
+    the AI put in the timing, independent of what source_label says.
+    """
+    return CanonicalSchedulePlan(
+        anchors=[ScheduleAnchor(
+            id="anchor-baseline", name="Randomization", anchor_type="randomization")],
+        events=[ScheduleEvent(
+            id="event-predose", name="Pre-dose Blood Samples (Days 12-14)",
+            timing=TimingExpression(
+                kind="range", anchor_id="anchor-baseline",
+                range_start=TemporalAmount(value=range_start_day, unit="day"),
+                range_end=TemporalAmount(value=range_end_day, unit="day"),
+                source_label="Days 12-14"))])
+
+
+def test_canonical_range_timing_is_corrected_to_match_its_own_source_label():
+    """Reproduces the exact CT25-007 bug: the model wrote source_label 'Days
+    12-14' but put 11/13 in the timing's own range_start/range_end. Before
+    this check existed, project_canonical_plan trusted the wrong numbers
+    outright — normalize_extracted_timing already caught this shape for the
+    legacy flat-visits path, but never ran on the canonical_plan path every
+    real AI extraction actually uses."""
+    plan = _housing_plan(range_start_day=11, range_end_day=13)
+
+    rows, warnings = project_canonical_plan(
+        plan, anchor_study_day=0, includes_day_zero=True)
+
+    assert rows[0]["day_offset"] == 12
+    assert rows[0]["day_end"] == 14
+    assert any("corrected deterministically" in warning for warning in warnings)
+
+
+def test_canonical_range_timing_correction_is_a_silent_noop_when_already_correct():
+    plan = _housing_plan(range_start_day=12, range_end_day=14)
+
+    rows, warnings = project_canonical_plan(
+        plan, anchor_study_day=0, includes_day_zero=True)
+
+    assert rows[0]["day_offset"] == 12
+    assert rows[0]["day_end"] == 14
+    assert warnings == []
+
+
+def test_canonical_range_timing_correction_requires_anchor_metadata():
+    """No stated Day 0/Day 1 convention means there is no reliable way to
+    convert 'Days 12-14' into an offset, so the wrong 11/13 must be left
+    exactly as the AI produced it — never guessed at — same as
+    simple_day_label_range_offsets' own None-anchor_study_day contract."""
+    plan = _housing_plan(range_start_day=11, range_end_day=13)
+
+    rows, warnings = project_canonical_plan(plan)
+
+    assert rows[0]["day_offset"] == 11
+    assert rows[0]["day_end"] == 13
+    assert warnings == []

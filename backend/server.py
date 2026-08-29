@@ -453,6 +453,12 @@ class PatientIn(BaseModel):
     # materialize_visit_instances then materializes every template, exactly
     # as it always has.
     substudy_label: Optional[str] = None
+    # Which arm/treatment-sequence (see GET /trials/{trial_id}/arms) this
+    # patient is enrolled under, for a trial whose visit templates are
+    # arm-tagged. None for every ordinary, single-arm/shared trial;
+    # materialize_visit_instances then materializes every arm-untagged
+    # template, exactly as it always has.
+    arm_label: Optional[str] = None
 
 
 class PatientInvitationIn(PatientIn):
@@ -4121,6 +4127,22 @@ async def list_trial_substudies(trial_id: str, user=Depends(current_user)):
     return sorted(label for label in labels if label)
 
 
+@api.get('/trials/{trial_id}/arms',
+         dependencies=[Depends(require_roles('sponsor', 'cro', 'pi', 'crc', 'smo', 'site'))])
+async def list_trial_arms(trial_id: str, user=Depends(current_user)):
+    """The distinct arm_label values saved on this trial's visits, for the
+    enrollment arm picker. Empty for every ordinary, single-arm/shared
+    trial — the picker only ever appears when there's something to
+    actually choose between."""
+    trial = await db.trials.find_one({'id': trial_id}, {'_id': 0})
+    if not trial:
+        raise HTTPException(404, 'Trial not found')
+    if not await _can_access_trial(user, trial):
+        raise HTTPException(403, 'You do not have access to this trial')
+    labels = await db.visits.distinct('arm_label', {'trial_id': trial_id})
+    return sorted(label for label in labels if label)
+
+
 @api.put('/visits/{visit_id}')
 async def update_visit(visit_id: str, body: VisitUpdate,
                        user=Depends(require_roles('sponsor', 'cro', 'pi'))):
@@ -4343,7 +4365,7 @@ async def my_visits(user=Depends(current_user)):
     instances = await db.visit_instances.find({'patient_id': patient['id']}, {'_id': 0}) \
                                         .sort('seq', 1).to_list(200)
     if instances:
-        return [{**inst, **care,
+        return [{**(await _ensure_visit_instance_workflow(inst)), **care,
                  'checklist': checklists.get(inst.get('visit_template_id'), [])}
                 for inst in instances]
     visits = await db.visits.find({'trial_id': patient['trial_id']}, {'_id': 0}).sort('visit_number', 1).to_list(200)
@@ -4362,6 +4384,12 @@ async def my_visits(user=Depends(current_user)):
             operational_status = (
                 'completed' if v['id'] in completed else 'manual_review')
             manual_review_reason = str(exc)
+        display_status = _effective_visit_status({
+            'operational_status': operational_status,
+            'scheduled_date': scheduled,
+            'window_start': window_start,
+            'window_end': window_end,
+        })
         result.append({
             **v, **care,
             'patient_id': patient['id'],
@@ -4370,7 +4398,7 @@ async def my_visits(user=Depends(current_user)):
             'window_start': iso(window_start),
             'window_end': iso(window_end),
             'checklist': v.get('checklist') or [],
-            'status': operational_status,
+            'status': display_status,
             'operational_status': operational_status,
             'manual_review_reason': manual_review_reason,
         })
@@ -4821,8 +4849,14 @@ async def materialize_visit_instances(patient) -> int:
     # substudy's own visits materialized — never the other substudies'.
     # An untagged template (every ordinary, single-schedule trial) still
     # matches every patient, so this is a no-op everywhere else.
+    # A patient enrolled under a specific arm/sequence (a trial whose visit
+    # templates are arm-tagged) only ever gets that arm's own visits
+    # materialized — never another arm's. An untagged template (every
+    # ordinary, single-arm/shared trial) still matches every patient, so
+    # this is a no-op everywhere else.
     templates = [t for t in templates
-                 if _template_matches_substudy(t, patient.get('substudy_label'))]
+                 if _template_matches_substudy(t, patient.get('substudy_label'))
+                 and _template_matches_arm(t, patient.get('arm_label'))]
     if not templates:
         return 0
     base = _patient_visit_anchor(patient)
@@ -4906,6 +4940,11 @@ async def _materialize_new_template_for_enrolled(template) -> int:
         # enrolled under is never materialized for them — same rule as the
         # initial materialize_visit_instances pass.
         if not _template_matches_substudy(template, patient.get('substudy_label')):
+            continue
+        # Same rule as the initial materialize_visit_instances pass: a
+        # template tagged for a different arm than this patient's own is
+        # never retro-fitted onto them.
+        if not _template_matches_arm(template, patient.get('arm_label')):
             continue
         base = _patient_visit_anchor(patient)
         try:
@@ -5064,9 +5103,10 @@ async def _migrate_visit_instances():
         logging.warning('Visit-instance migration deferred (DB unreachable?): %s', e)
 
 # ── Patients ────────────────────────────────────────────────────────────────
-# Statuses that still need action (as opposed to 'completed' / 'missed', which
-# are terminal for a given visit instance).
-_ACTIONABLE_VISIT_STATUSES = ('scheduled', 'upcoming', 'overdue')
+# The non-terminal display statuses _effective_visit_status can return (as
+# opposed to 'completed' / 'missed' / 'screen_fail' / etc., which are
+# terminal for a given visit instance).
+_ACTIONABLE_VISIT_STATUSES = ('overdue', 'due', 'planned')
 
 
 def _derive_patient_status(instances, start_today):
@@ -5079,10 +5119,14 @@ def _derive_patient_status(instances, start_today):
     - every instance completed            → 'completed'
     - otherwise (only missed remain)      → 'active'
     `next_visit` is the soonest actionable instance (past-due first, else the
-    next upcoming), or None when nothing is actionable.
+    next upcoming), or None when nothing is actionable. A stored instance
+    only ever carries a static 'planned'/'completed' status — its real
+    overdue/due/planned state is derived here via _effective_visit_status,
+    the same derivation GET /patients/{id}/visits and GET /tasks apply.
     """
     if not instances:
         return 'no_visits', None
+    instances = [{**i, 'status': _effective_visit_status(i)} for i in instances]
     actionable = [i for i in instances
                   if i.get('status') in _ACTIONABLE_VISIT_STATUSES
                   and isinstance(i.get('scheduled_date'), datetime)]
@@ -9440,6 +9484,41 @@ async def delete_file(file_id: str, user=Depends(current_user)):
 async def root(): return {'app': 'My Trial Board', 'status': 'ok'}
 
 app.include_router(api)
+
+# Replacement schedule APIs are isolated from the legacy Mongo visit scheduler.
+# A PostgreSQL connection is opened only when an /api/uctsm endpoint is called.
+from app.api.uctsm import create_uctsm_router       # noqa: E402
+
+async def current_uctsm_user(user=Depends(current_user)):
+    """Attach the authoritative organization UUID used for SQL tenant scoping."""
+    organization = await find_organization_by_name(user.get('organization'))
+    if not organization or not organization.get('id'):
+        raise HTTPException(403, 'No organization context is available')
+    return {**user, 'organization_id': organization['id']}
+
+app.include_router(create_uctsm_router(current_uctsm_user))
+
+@app.middleware('http')
+async def disable_legacy_schedule_authoring(request: Request, call_next):
+    """Fail closed after cutover instead of silently invoking visit-gap logic."""
+    if os.getenv('UCTSM_AUTHORITATIVE', '').strip().lower() in {'1', 'true', 'yes'}:
+        path = request.url.path
+        method = request.method.upper()
+        legacy_authoring = (
+            path.endswith('/extract-schedule')
+            or path.endswith('/schedule-preview')
+            or path.endswith('/schedule-definition')
+            or path.startswith('/api/schedules/')
+            or path.startswith('/api/schedule-reviews')
+            or (path.startswith('/api/visits') and method in {'POST', 'PUT', 'PATCH', 'DELETE'})
+        )
+        if legacy_authoring and not path.startswith('/api/uctsm/'):
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=410,
+                content={'detail': 'Legacy visit-gap scheduling is disabled; use /api/uctsm.'},
+            )
+    return await call_next(request)
 
 # ── Admin + org-admin routers (Task 6.1) ─────────────────────────────────────
 # Imported at the bottom on purpose: admin_routes/org_routes import helpers

@@ -50,7 +50,6 @@ repair passes in `backend/.env`:
 ```dotenv
 PROTOCOL_EXTRACTION_PROVIDER=gemini
 GEMINI_API_KEY=your-key
-GEMINI_PROTOCOL_CONFIRMATION_MODEL=your-independent-confirmation-model
 PROTOCOL_EXTRACTION_MAX_REFINEMENTS=2
 ```
 
