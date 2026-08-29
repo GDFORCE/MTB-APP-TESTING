@@ -77,3 +77,32 @@ export type ScheduleProjection = {
   evidence_refs: string[];
 };
 
+export type ApprovedScheduleSummary = {
+  schedule_definition_id: string;
+  schedule_version_id: string;
+  name: string;
+  schedule_type: string;
+  version_number: number;
+  approved_at?: string;
+};
+
+export type PatientScheduleEvent = {
+  id: string;
+  event_definition_id: string;
+  occurrence_index: number;
+  status: string;
+  nominal_start_date?: string;
+  nominal_end_date?: string;
+  earliest_date?: string;
+  latest_date?: string;
+  timing_resolution?: Record<string, unknown>;
+  explanation?: Record<string, unknown>;
+};
+
+export type PatientScheduleResponse = {
+  patient_id: string;
+  status: string;
+  schedule_version_id?: string;
+  evaluation_id?: string;
+  events: PatientScheduleEvent[];
+};

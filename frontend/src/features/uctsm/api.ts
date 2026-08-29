@@ -1,5 +1,8 @@
 import { api } from "@/src/api/client";
-import type { ScheduleEvent, ScheduleProjection, UniversalSchedule, ValidationIssue } from "./types";
+import type {
+  ApprovedScheduleSummary, PatientScheduleResponse, ScheduleEvent,
+  ScheduleProjection, UniversalSchedule, ValidationIssue,
+} from "./types";
 
 const root = "/uctsm";
 
@@ -21,6 +24,11 @@ export async function getUniversalSchedule(scheduleVersionId: string) {
 
 export async function getScheduleProjection(scheduleVersionId: string) {
   const response = await api.get<ScheduleProjection[]>(`${root}/schedule-versions/${scheduleVersionId}/projection`);
+  return response.data;
+}
+
+export async function getApprovedSchedules(trialId: string) {
+  const response = await api.get<ApprovedScheduleSummary[]>(`${root}/trials/${trialId}/approved-schedules`);
   return response.data;
 }
 
@@ -115,6 +123,6 @@ export async function recordPatientState(
 }
 
 export async function getPatientSchedule(patientId: string) {
-  const response = await api.get(`${root}/patients/${patientId}/schedule`);
+  const response = await api.get<PatientScheduleResponse>(`${root}/patients/${patientId}/schedule`);
   return response.data;
 }

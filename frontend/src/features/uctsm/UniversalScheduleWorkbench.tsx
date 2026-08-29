@@ -3,6 +3,7 @@ import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, TextInput,
 import { useRouter } from "expo-router";
 import { ArrowLeft, CalendarDays, CheckCircle2, FlaskConical, RefreshCw, ShieldCheck, TriangleAlert } from "lucide-react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import { Body, Small } from "@/src/components/ui";
 import { colors, radii, shadows, spacing } from "@/src/theme/tokens";
@@ -66,6 +67,8 @@ export default function UniversalScheduleWorkbench() {
 
   const loadDemo = () => run("seed", async () => {
     const workspace = await seedDemoWorkspace();
+    await AsyncStorage.setItem("uctsm:last_schedule_version_id", workspace.schedule_version_id);
+    await AsyncStorage.setItem("uctsm:last_patient_id", workspace.patient_id);
     setPatientId(workspace.patient_id);
     await refresh(workspace.schedule_version_id);
     setNotice("Test workspace loaded. Start with deterministic validation.");
@@ -290,4 +293,3 @@ const styles = StyleSheet.create({
   resultRow: { marginTop: 10, padding: 11, borderRadius: radii.md, backgroundColor: colors.surface, gap: 3 },
   resultTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 },
 });
-

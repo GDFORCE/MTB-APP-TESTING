@@ -11,6 +11,7 @@
     "web": "expo start --web",
     "lint": "expo lint",
     "test:visit-timing": "node --experimental-strip-types --test tests/visit-timing.test.ts",
+    "test:uctsm-presentation": "node --experimental-strip-types --test tests/uctsm-presentation.test.ts",
     "check:actions": "node ./scripts/action-map-check.js"
   },
   "dependencies": {

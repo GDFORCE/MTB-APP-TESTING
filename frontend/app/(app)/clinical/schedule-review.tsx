@@ -1,1 +1,1 @@
-export { default } from "@/src/features/uctsm/UniversalScheduleWorkbench";
+export { default } from "@/src/features/uctsm/ProtocolScheduleScreen";
