@@ -1,8 +1,8 @@
-# MTB-APP
+# MTB-APP-TESTING
 
 Clinical-trials app: Expo (React Native) frontend + FastAPI/MongoDB backend.
 
-Active development happens on the `full-app-build` branch.
+The universal schedule engine and its in-app test workbench are available on `main`.
 
 ## Prerequisites
 - Git
@@ -14,9 +14,8 @@ Active development happens on the `full-app-build` branch.
 
 ## 1. Clone
 ```
-git clone https://github.com/GDFORCE/MTB-APP.git
-cd MTB-APP
-git checkout full-app-build
+git clone https://github.com/GDFORCE/MTB-APP-TESTING.git
+cd MTB-APP-TESTING
 ```
 
 ## 2. Backend (FastAPI)
