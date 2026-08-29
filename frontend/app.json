@@ -1,0 +1,78 @@
+{
+  "expo": {
+    "name": "My Trial Board",
+    "slug": "my-trial-board",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/mtb-icon.png",
+    "scheme": "mytrialboard",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.gdforce.mytrialboard",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/mtb-adaptive-icon.png",
+        "backgroundColor": "#FBF2E8"
+      },
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
+      ]
+    },
+    "androidNavigationBar": {
+      "backgroundColor": "#FEFAF1",
+      "barStyle": "dark-content",
+      "enforceContrast": false
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./assets/images/mtb-icon.png"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-secure-store",
+        {
+          "configureAndroidBackup": true,
+          "faceIDPermission": "Allow My Trial Board to securely unlock your session."
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/images/mtb-splash.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#FBF2E8"
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Allow My Trial Board to access your microphone to record voice messages."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow My Trial Board to access your photos to set a profile picture.",
+          "cameraPermission": "Allow My Trial Board to access your camera to take a profile picture."
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "7e47abe3-bbf9-4687-8dd2-1254aa4dda8a"
+      }
+    }
+  }
+}

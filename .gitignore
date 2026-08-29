@@ -1,0 +1,115 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# IDE and editors
+.idea/
+.vscode/
+
+# Dependencies
+node_modules/
+/node_modules
+/.pnp
+.pnp.js
+.yarn/install-state.gz
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# Testing
+/coverage
+
+# Next.js
+/.next/
+/out/
+next-env.d.ts
+*.tsbuildinfo
+
+# Production builds
+/build
+dist/
+dist
+
+# Environment files (comprehensive coverage)
+
+*token.json*
+*credentials.json*
+
+# Logs and debug files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+dump.rdb
+backend/backend-dev*.log
+frontend/expo-dev*.log
+
+# System files
+.DS_Store
+*.pem
+
+# Python
+__pycache__/
+*pyc*
+venv/
+.venv/
+
+# Development tools
+chainlit.md
+.chainlit
+.ipynb_checkpoints/
+.ac
+
+# Deployment
+.vercel
+
+# Data and databases
+agenthub/agents/youtube/db
+backend/uctsm-dev.db*
+
+# Archive files and large assets
+**/*.zip
+**/*.tar.gz
+**/*.tar
+**/*.tgz
+*.pack
+*.deb
+*.dylib
+
+# Build caches
+.cache/
+frontend/.tmp-expo/
+frontend/.eslintcache
+
+# Local Expo QR snapshots
+frontend/expo-go-qr*.png
+
+memory/test_credentials.md
+
+# Uploaded files (blobs may contain PHI — never commit them; dir kept via .gitkeep)
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# Mobile development
+android-sdk/
+.env
+.env.*
+*.env
+!.env.example
+credentials.json
+*.key
+.credentials
+
+# Git worktrees (used for isolated feature work)
+.worktrees/
+
+# Manual backup snapshots and scratch/temp working files
+.backup-protocol-upgrade-*/
+.tmp/
+
+# Protocol PDFs uploaded locally for testing — may be confidential/proprietary
+/pdf.pdf
+/*.pdf
+
+# Native module local Android build cache
+frontend/modules/**/android/.gradle/
