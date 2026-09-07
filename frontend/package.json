@@ -12,7 +12,12 @@
     "lint": "expo lint",
     "test:visit-timing": "node --experimental-strip-types --test tests/visit-timing.test.ts",
     "test:uctsm-presentation": "node --experimental-strip-types --test tests/uctsm-presentation.test.ts",
-    "check:actions": "node ./scripts/action-map-check.js"
+    "check:actions": "node ./scripts/action-map-check.js",
+    "test:uctsm-tabular-ui": "node --experimental-strip-types --test tests/uctsm-tabular-ui.test.ts",
+    "test:uctsm": "node --experimental-strip-types --test tests/uctsm-presentation.test.ts tests/uctsm-tabular-ui.test.ts tests/uctsm-event-types.test.ts tests/uctsm-review-surfaces.test.ts tests/uctsm-versions.test.ts tests/visit-timing.test.ts",
+    "test:uctsm-versions": "node --experimental-strip-types --test tests/uctsm-versions.test.ts",
+    "test:uctsm-event-types": "node --experimental-strip-types --test tests/uctsm-event-types.test.ts",
+    "test:uctsm-review": "node --experimental-strip-types --test tests/uctsm-review-surfaces.test.ts"
   },
   "dependencies": {
     "@expo/metro-runtime": "6.1.2",

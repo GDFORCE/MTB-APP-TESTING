@@ -73,3 +73,10 @@ def test_langgraph_pipeline_is_claim_based_and_returns_typed_schedule():
     assert not result.issues
     assert [item["node"] for item in result.extraction_trace][:2] == ["DOCUMENT_STRUCTURE", "FIND_SCHEDULE_SECTIONS"]
     assert result.extraction_trace[-1]["node"] == "FINAL_VALIDATION"
+    nodes = {item["node"] for item in result.extraction_trace}
+    assert {
+        "EXTRACT_DEPENDENCY_MODES", "EXTRACT_REPEAT_BLOCKS",
+        "EXTRACT_ACTIVITY_TIMING", "EXTRACT_QUALIFIERS",
+        "EXTRACT_CONDITIONAL_ACTIONS", "EXTRACT_CONDITIONAL_RESOLUTION",
+        "EXTRACT_CONFINEMENT",
+    } <= nodes

@@ -41,6 +41,10 @@ class ScheduleRepository:
             extraction_run_id=extraction_run_id,
             schema_version=schedule.schema_version,
             metadata_json=schedule.schedule_metadata.model_dump(mode="json", exclude={"status", "version_number", "protocol_version_id"}),
+            dimensions=_json(schedule.dimensions),
+            conditional_definitions=_json(schedule.conditional_definitions),
+            repeat_blocks=_json(schedule.repeat_blocks),
+            confinement_episodes=_json(schedule.confinement_episodes),
             created_at=schedule.created_at,
         )
         self.session.add(version)
@@ -58,13 +62,16 @@ class ScheduleRepository:
                     id=item.id, schedule_version_id=version.id, code=item.code,
                     protocol_label=item.protocol_label, display_name=item.display_name,
                     description=item.description, criteria=_json(item.criteria),
+                    parent_dimension_type=item.parent_dimension_type,
+                    parent_code=item.parent_code,
                 ))
         for item in schedule.anchors:
             self.session.add(db.Anchor(
                 id=item.id, schedule_version_id=version.id, code=item.code,
                 protocol_label=item.protocol_label, display_name=item.display_name,
                 anchor_type=item.anchor_type, derivation_rule=item.derivation_rule,
-                source_event_code=item.source_event_code, status=item.status,
+                source_event_code=item.source_event_code,
+                source_condition_code=item.source_condition_code, status=item.status,
                 evidence_refs=_json(item.evidence_refs),
             ))
         event_ids = {item.code: item.id for item in schedule.events}
@@ -73,8 +80,14 @@ class ScheduleRepository:
                 id=item.id, schedule_version_id=version.id, code=item.code,
                 protocol_label=item.protocol_label, display_name=item.display_name,
                 normalized_name=item.normalized_name, event_type=item.event_type,
+                visit_mode=item.visit_mode,
+                allowed_visit_modes=_json(item.allowed_visit_modes),
+                activation=item.activation,
                 epoch_id=item.epoch_id, sequence_number=item.sequence_number,
                 timing=_json(item.timing), conditions=_json(item.conditions),
+                dependency_mode=item.dependency_mode.value if item.dependency_mode else None,
+                conditional_actions=_json(item.conditional_actions),
+                qualifiers=_json(item.qualifiers), confinement=_json(item.confinement),
                 metadata_json=item.metadata,
                 interpretation_status=item.interpretation_status.value,
                 requires_review=item.requires_review, evidence_refs=_json(item.evidence_refs),
@@ -90,6 +103,7 @@ class ScheduleRepository:
                     protocol_label=activity.protocol_label, display_name=activity.display_name,
                     activity_type=activity.activity_type, requiredness=activity.requiredness.value,
                     timing=_json(activity.timing), conditions=_json(activity.conditions),
+                    applicability=_json(activity.applicability), qualifiers=_json(activity.qualifiers),
                     metadata_json=activity.metadata,
                     interpretation_status=activity.interpretation_status.value,
                     requires_review=activity.requires_review,
@@ -158,6 +172,10 @@ class ScheduleRepository:
         row.sequence_number = event.sequence_number
         row.timing = _json(event.timing)
         row.conditions = _json(event.conditions)
+        row.dependency_mode = event.dependency_mode.value if event.dependency_mode else None
+        row.conditional_actions = _json(event.conditional_actions)
+        row.qualifiers = _json(event.qualifiers)
+        row.confinement = _json(event.confinement)
         row.metadata_json = event.metadata
         row.interpretation_status = event.interpretation_status.value
         row.requires_review = event.requires_review
@@ -190,6 +208,7 @@ class ScheduleRepository:
                 protocol_label=activity.protocol_label, display_name=activity.display_name,
                 activity_type=activity.activity_type, requiredness=activity.requiredness.value,
                 timing=_json(activity.timing), conditions=_json(activity.conditions),
+                applicability=_json(activity.applicability), qualifiers=_json(activity.qualifiers),
                 metadata_json=activity.metadata,
                 interpretation_status=activity.interpretation_status.value,
                 requires_review=activity.requires_review,
@@ -210,6 +229,7 @@ class ScheduleRepository:
             "protocol_version_id": definition.protocol_version_id,
             "version_number": version.version_number,
             "status": version.status,
+            "effective_from": version.effective_from,
         })
         epochs = [domain.Epoch.model_validate({
             "id": row.id, "code": row.code, "protocol_label": row.protocol_label,
@@ -223,12 +243,15 @@ class ScheduleRepository:
                 "id": row.id, "code": row.code, "protocol_label": row.protocol_label,
                 "display_name": row.display_name, "description": row.description,
                 "criteria": row.criteria,
+                "parent_dimension_type": row.parent_dimension_type,
+                "parent_code": row.parent_code,
             }) for row in self.session.scalars(select(cls).where(cls.schedule_version_id == version.id))]
 
         anchors = [domain.Anchor.model_validate({
             "id": row.id, "code": row.code, "protocol_label": row.protocol_label,
             "display_name": row.display_name, "anchor_type": row.anchor_type,
             "derivation_rule": row.derivation_rule, "source_event_code": row.source_event_code,
+            "source_condition_code": row.source_condition_code,
             "status": row.status, "evidence_refs": row.evidence_refs,
         }) for row in self.session.scalars(select(db.Anchor).where(db.Anchor.schedule_version_id == version.id))]
         event_rows = list(self.session.scalars(select(db.Event).where(db.Event.schedule_version_id == version.id).order_by(db.Event.sequence_number, db.Event.code)))
@@ -246,6 +269,7 @@ class ScheduleRepository:
                     "display_name": row.display_name, "activity_type": row.activity_type,
                     "requiredness": row.requiredness, "timing": row.timing,
                     "conditions": row.conditions, "metadata": row.metadata_json,
+                    "applicability": row.applicability or [], "qualifiers": row.qualifiers or [],
                     "interpretation_status": row.interpretation_status,
                     "requires_review": row.requires_review, "evidence_refs": row.evidence_refs,
                 })
@@ -261,8 +285,14 @@ class ScheduleRepository:
             "id": row.id, "code": row.code, "protocol_label": row.protocol_label,
             "display_name": row.display_name, "normalized_name": row.normalized_name,
             "event_type": row.event_type, "epoch_id": row.epoch_id,
+            "visit_mode": row.visit_mode,
+            "allowed_visit_modes": row.allowed_visit_modes or [],
+            "activation": row.activation or "SCHEDULED",
             "sequence_number": row.sequence_number, "timing": row.timing,
             "conditions": row.conditions, "applicability": applicability[row.id],
+            "dependency_mode": row.dependency_mode,
+            "conditional_actions": row.conditional_actions or [],
+            "qualifiers": row.qualifiers or [], "confinement": row.confinement,
             "dependencies": dependencies[row.id], "recurrence": recurrence.get(row.id),
             "activities": activities[row.id], "evidence_refs": row.evidence_refs,
             "interpretation_status": row.interpretation_status,
@@ -292,6 +322,10 @@ class ScheduleRepository:
             schedule_metadata=domain.ScheduleMetadata.model_validate(metadata),
             epochs=epochs, arms=dimensions(db.Arm), cohorts=dimensions(db.Cohort),
             populations=dimensions(db.Population), anchors=anchors, events=events,
+            dimensions=[domain.GenericDimension.model_validate(item) for item in (version.dimensions or [])],
+            conditional_definitions=[domain.ConditionalDefinition.model_validate(item) for item in (version.conditional_definitions or [])],
+            repeat_blocks=[domain.RepeatBlock.model_validate(item) for item in (version.repeat_blocks or [])],
+            confinement_episodes=[domain.ConfinementEpisodeDefinition.model_validate(item) for item in (version.confinement_episodes or [])],
             evidence=evidence, claim_evidence=claims, validation_issues=issues,
             created_at=version.created_at,
         )

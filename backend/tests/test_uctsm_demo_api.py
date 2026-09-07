@@ -55,7 +55,7 @@ def test_demo_screen_workflow_from_seed_through_patient_evaluation(monkeypatch):
     schedule = schedule_response.json()
     assert schedule["schedule_metadata"]["status"] == "VALIDATION_REQUIRED"
     assert {event["code"] for event in schedule["events"]} == {
-        "SAFETY_FOLLOW_UP", "PROGRESSION_ASSESSMENT",
+        "SAFETY_FOLLOW_UP", "PROGRESSION_ASSESSMENT", "UNSCHEDULED_VISIT",
     }
 
     validation = client.post(f"/api/uctsm/schedule-versions/{version_id}/validate")
@@ -88,16 +88,31 @@ def test_demo_screen_workflow_from_seed_through_patient_evaluation(monkeypatch):
     assert approval.json()["status"] == "APPROVED"
 
     last_dose = next(anchor for anchor in schedule["anchors"] if anchor["code"] == "LAST_DOSE")
+    # Recording an anchor produces a CANDIDATE. Doc 1 sections 10 and 16 require the
+    # schedule impact to be shown and confirmed before dependent visits move.
     anchor_response = client.post(
         f"/api/uctsm/patients/{patient_id}/anchors",
         json={
             "anchor_definition_id": last_dose["id"],
             "value_date": "2026-12-15",
-            "status": "CONFIRMED",
             "source_type": "DEMO_UI",
         },
     )
     assert anchor_response.status_code == 201, anchor_response.text
+    candidate = anchor_response.json()
+    assert candidate["status"] == "PENDING_CONFIRMATION"
+    assert candidate["impact_preview_required"] is True
+
+    preview = client.post(
+        f"/api/uctsm/patients/{patient_id}/anchors/{candidate['id']}/impact-preview",
+        json={"horizon": "2028-12-31", "reason": "Last dose recorded at the site."},
+    )
+    assert preview.status_code == 201, preview.text
+    confirmation = client.post(
+        f"/api/uctsm/schedule-impact-proposals/{preview.json()['id']}/confirm",
+        json={"reason": "PI confirmed the last dose date."},
+    )
+    assert confirmation.status_code == 200, confirmation.text
 
     evaluated = client.post(
         f"/api/uctsm/patients/{patient_id}/schedule/evaluate",

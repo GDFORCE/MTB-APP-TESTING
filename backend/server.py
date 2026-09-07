@@ -28,6 +28,9 @@ import protocol_extraction as pe
 from schedule_schema import apply_temporal_amount, classify_visit_activities, TemporalAmount
 import storage as file_storage
 import google_places
+from app.db.base import build_session_factory
+from app.services.operational_bridge import OperationalBridgeService
+from app.services.operational_projection import bridge_visit_documents
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -459,6 +462,21 @@ class PatientIn(BaseModel):
     # materialize_visit_instances then materializes every arm-untagged
     # template, exactly as it always has.
     arm_label: Optional[str] = None
+    # Which cohort this patient is enrolled under, when the approved canonical
+    # schedule defines cohorts. None for a trial that does not.
+    cohort_label: Optional[str] = None
+    # Every other protocol grouping the approved schedule defines - PART,
+    # SEQUENCE, SUBSTUDY, POPULATION or a term the protocol invented - keyed by
+    # dimension name (doc 8 s35). Only the dimensions THIS protocol defines are
+    # ever sent, because a form that asks every trial for a cohort teaches sites
+    # to type something into a field that does not apply to their study.
+    dimension_values: Optional[dict[str, list[str]]] = None
+
+
+class UctsmTrialLinkIn(BaseModel):
+    canonical_trial_id: str
+    schedule_definition_id: str
+    external_schedule_definition_id: Optional[str] = None
 
 
 class PatientInvitationIn(PatientIn):
@@ -1556,7 +1574,17 @@ async def _complete_registration(pending: dict) -> dict:
                             patient_doc[profile_key] = registration_profile[profile_key]
                     await db.patients.insert_one(patient_doc)
                     created_patient_id = patient_id
-                    created_visits = await materialize_visit_instances(patient_doc)
+                    enrollment_trial = await db.trials.find_one(
+                        {'id': invitation['trial_id']}, {'_id': 0}) or {}
+                    enrollment_actor = await db.users.find_one(
+                        {'id': invitation.get('invited_by')}, {'_id': 0})
+                    enrollment_actor = enrollment_actor or session['user']
+                    created_visits = await _project_operational_enrollment(
+                        patient_doc, enrollment_trial, enrollment_actor)
+                    schedule_source = 'canonical UCTSM'
+                    if created_visits < 0:
+                        created_visits = await materialize_visit_instances(patient_doc)
+                        schedule_source = 'legacy templates'
                     await db.invitations.update_one(
                         {'id': invitation['id'], 'status': 'accepted'},
                         {'$set': {'patient_id': patient_id}},
@@ -1564,7 +1592,7 @@ async def _complete_registration(pending: dict) -> dict:
                     await write_audit(
                         session['user'], 'patient.enroll',
                         f"Accepted invitation and enrolled in trial {invitation['trial_id']} "
-                        f"({created_visits} visit instance(s) materialized)",
+                        f"({created_visits} visit instance(s) materialized from {schedule_source})",
                         target_id=patient_id, trial_id=invitation['trial_id'],
                     )
                 else:
@@ -4346,6 +4374,62 @@ async def _patient_visit_detail(patient: dict, visit: dict) -> dict:
         'checklist': preparation,
     })
 
+async def _apply_canonical_dates(patient: dict, rows: list) -> list:
+    """Overlay the canonical engine's visit dates when this trial has cut over.
+
+    Returns `rows` untouched unless the trial is explicitly in ENGINE read mode,
+    which requires a recorded parity run that matched for every patient on the
+    version they are pinned to. Any failure here also returns the rows untouched:
+    a schedule read must not break because the canonical side is unavailable.
+
+    Only dates move. The operational documents keep their identity, comments,
+    tasks and workflow state, so reverting is instant and nothing is lost.
+    """
+    if not rows or not patient or not patient.get('trial_id'):
+        return rows
+    try:
+        from sqlalchemy import select as _select
+        from app.db import models as _db
+        from app.db.base import get_session
+        from app.services.operational_read import apply_engine_dates
+        from app.services.parity_service import (
+            READ_MODE_ENGINE, ParityService, read_mode_for_trial,
+        )
+        from app.services.schedule_service import PatientScheduleService
+    except Exception:
+        return rows
+
+    def _read():
+        for session in get_session():
+            try:
+                if read_mode_for_trial(session, str(patient['trial_id'])) != READ_MODE_ENGINE:
+                    return None
+                linked = session.scalar(_select(_db.Patient).where(
+                    _db.Patient.external_patient_id == str(patient.get('id')),
+                ))
+                if linked is None or linked.current_schedule_version_id is None:
+                    return None
+                _evaluation, events = PatientScheduleService(session).evaluate(
+                    linked.id, organization_id=linked.organization_id,
+                    horizon=date.today() + timedelta(days=730),
+                )
+                session.commit()
+                return ParityService(session)._engine_rows(linked, events)
+            finally:
+                session.close()
+        return None
+
+    try:
+        engine_rows = await asyncio.to_thread(_read)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            'canonical visit dates unavailable; serving operational dates')
+        return rows
+    if not engine_rows:
+        return rows
+    return apply_engine_dates(rows, engine_rows)
+
+
 @api.get('/visits/mine')
 async def my_visits(user=Depends(current_user)):
     """Return upcoming/completed visits for the logged-in patient.
@@ -4362,18 +4446,26 @@ async def my_visits(user=Depends(current_user)):
     if not patient: return []
     care = await _patient_care_context(patient)
     checklists = await _trial_checklist_map(patient['trial_id'])
-    instances = await db.visit_instances.find({'patient_id': patient['id']}, {'_id': 0}) \
-                                        .sort('seq', 1).to_list(200)
+    instances = _order_visit_instances(
+        await db.visit_instances.find({'patient_id': patient['id']}, {'_id': 0}).to_list(200))
     if instances:
+        instances = await _apply_canonical_dates(patient, instances)
         return [{**(await _ensure_visit_instance_workflow(inst)), **care,
                  'checklist': checklists.get(inst.get('visit_template_id'), [])}
                 for inst in instances]
     visits = await db.visits.find({'trial_id': patient['trial_id']}, {'_id': 0}).sort('visit_number', 1).to_list(200)
     completed = set(patient.get('completed_visit_ids', []))
     result = []
-    base_date = _patient_visit_anchor(patient)
+    try:
+        base_date = _patient_visit_anchor(patient)
+        anchor_error = None
+    except ValueError as exc:
+        base_date = None
+        anchor_error = exc
     for v in visits:
         try:
+            if anchor_error is not None:
+                raise anchor_error
             scheduled = _calculate_template_datetime(base_date, v)
             scheduled_end = _calculate_template_end_datetime(base_date, v, scheduled)
             window_start, window_end = _schedule_window(v, scheduled)
@@ -4445,21 +4537,29 @@ async def my_visit_detail(visit_id: str, user=Depends(current_user)):
 
 def _patient_visit_anchor(patient) -> datetime:
     """The date a patient's visit schedule anchors on: their baseline date when
-    present, else the enrolment date (legacy / seed patients), else now. Always
-    returned tz-aware (UTC) so date math is stable."""
-    base = None
+    present, else the explicit enrolment date for legacy/seed patients.
+
+    Never substitutes the current date. Missing or invalid clinical anchors must
+    remain visibly unresolved so downstream materialization can require review.
+    """
+    if not patient:
+        raise ValueError('Patient record is unavailable; visit anchor is unresolved')
     for cand in (patient.get('baseline_date'), patient.get('enrolled_date')):
         if cand:
             try:
-                base = datetime.fromisoformat(cand)
-                break
-            except (TypeError, ValueError):
+                if isinstance(cand, datetime):
+                    base = cand
+                elif isinstance(cand, date):
+                    base = datetime.combine(cand, datetime.min.time())
+                else:
+                    base = datetime.fromisoformat(str(cand).replace('Z', '+00:00'))
+                if base.tzinfo is None:
+                    base = base.replace(tzinfo=timezone.utc)
+                return base
+            except (TypeError, ValueError, OverflowError):
                 continue
-    if base is None:
-        base = now()
-    if base.tzinfo is None:
-        base = base.replace(tzinfo=timezone.utc)
-    return base
+    raise ValueError(
+        'Patient has no valid baseline_date or enrolled_date; visit dates require manual review')
 
 
 def _schedule_window(template: dict, scheduled: datetime) -> tuple[datetime, datetime]:
@@ -4806,6 +4906,80 @@ def _effective_visit_status(instance: dict) -> str:
     return 'planned'
 
 
+def _instance_scheduled_datetime(instance: dict):
+    """The instance's scheduled date as an aware datetime, or None."""
+    scheduled = instance.get('scheduled_date')
+    if isinstance(scheduled, str):
+        try:
+            scheduled = datetime.fromisoformat(scheduled.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+    if not isinstance(scheduled, datetime):
+        return None
+    return scheduled if scheduled.tzinfo else scheduled.replace(tzinfo=timezone.utc)
+
+
+def _instance_seq_value(instance: dict) -> float:
+    """The instance's ordering number, tolerating the fractional seq an
+    inserted visit carries so it can sit between two protocol visits."""
+    raw = instance.get('seq')
+    if raw is None:
+        raw = instance.get('visit_number')
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _visit_instance_order_key(instance: dict) -> tuple:
+    """Order a patient's visit instances the way a calendar reads them.
+
+    Dated visits come first in date order, so a visit added or re-dated
+    mid-trial lands *between* its neighbours rather than being pushed to the
+    top or the bottom of the timeline. Visits with no calculable date
+    (manual review) sit at the end in protocol order, where they cannot be
+    mistaken for the next thing due. `seq` is the tie-break, so an inserted
+    visit's fractional seq still resolves a same-day tie against the protocol
+    visit it was added beside.
+    """
+    scheduled = _instance_scheduled_datetime(instance)
+    seq = _instance_seq_value(instance)
+    if scheduled is None:
+        return (1, datetime.max.replace(tzinfo=timezone.utc), seq)
+    return (0, scheduled, seq)
+
+
+def _order_visit_instances(rows: list) -> list:
+    """Sort visit instances chronologically (see _visit_instance_order_key)."""
+    return sorted(rows or [], key=_visit_instance_order_key)
+
+
+def _insertion_seq(instances: list, scheduled: datetime) -> float:
+    """The ordering number that drops a newly added visit BETWEEN the visits
+    it falls between by date.
+
+    Returns the midpoint of its two dated neighbours' seq values, so the added
+    visit keeps its place for every consumer that still reads `seq` — and so
+    the protocol visits either side keep the numbers the site already knows
+    them by, instead of everything after the insertion point shifting up one.
+    """
+    dated = sorted(
+        ((when, _instance_seq_value(item)) for item in instances or []
+         if (when := _instance_scheduled_datetime(item)) is not None),
+        key=lambda pair: pair,
+    )
+    before = [seq for when, seq in dated if when <= scheduled]
+    after = [seq for when, seq in dated if when > scheduled]
+    if before and after:
+        low, high = max(before), min(after)
+        return (low + high) / 2 if high > low else low + 0.5
+    if before:
+        return max(before) + 1
+    if after:
+        return min(after) - 1
+    return 1.0
+
+
 async def _ensure_visit_instance_workflow(instance: dict) -> dict:
     """Lazily migrate legacy instances to per-visit task/comment snapshots."""
     if not instance:
@@ -4859,11 +5033,18 @@ async def materialize_visit_instances(patient) -> int:
                  and _template_matches_arm(t, patient.get('arm_label'))]
     if not templates:
         return 0
-    base = _patient_visit_anchor(patient)
+    try:
+        base = _patient_visit_anchor(patient)
+        anchor_error = None
+    except ValueError as exc:
+        base = None
+        anchor_error = exc
     completed = set(patient.get('completed_visit_ids') or [])
     docs = []
     for t in templates:
         try:
+            if anchor_error is not None:
+                raise anchor_error
             sched = _calculate_template_datetime(base, t)
             scheduled_end = _calculate_template_end_datetime(base, t, sched)
             window_start, window_end = _schedule_window(t, sched)
@@ -4946,8 +5127,8 @@ async def _materialize_new_template_for_enrolled(template) -> int:
         # never retro-fitted onto them.
         if not _template_matches_arm(template, patient.get('arm_label')):
             continue
-        base = _patient_visit_anchor(patient)
         try:
+            base = _patient_visit_anchor(patient)
             sched = _calculate_template_datetime(base, template)
             scheduled_end = _calculate_template_end_datetime(base, template, sched)
             window_start, window_end = _schedule_window(template, sched)
@@ -5027,7 +5208,8 @@ async def _rematerialize_template_change(template) -> int:
     number of instances updated."""
     n = now()
     updated = 0
-    anchors: Dict[str, datetime] = {}
+    anchors: Dict[str, Optional[datetime]] = {}
+    anchor_errors: Dict[str, ValueError] = {}
     async for inst in db.visit_instances.find(
             {'visit_template_id': template['id']}, {'_id': 0}):
         if not _instance_is_repointable(inst, n):
@@ -5035,8 +5217,14 @@ async def _rematerialize_template_change(template) -> int:
         pid = inst['patient_id']
         if pid not in anchors:
             patient = await db.patients.find_one({'id': pid}, {'_id': 0})
-            anchors[pid] = _patient_visit_anchor(patient) if patient else n
+            try:
+                anchors[pid] = _patient_visit_anchor(patient)
+            except ValueError as exc:
+                anchors[pid] = None
+                anchor_errors[pid] = exc
         try:
+            if pid in anchor_errors:
+                raise anchor_errors[pid]
             sched = _calculate_template_datetime(anchors[pid], template)
             scheduled_end = _calculate_template_end_datetime(
                 anchors[pid], template, sched)
@@ -5336,6 +5524,501 @@ async def _pi_owns_trial(user: dict, trial: dict) -> bool:
     return mine is not None
 
 
+_operational_session_factory = None
+
+
+def _canonical_uuid(value: Any, label: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError(f'{label} must be a UUID') from exc
+
+
+def _operational_factory():
+    global _operational_session_factory
+    if _operational_session_factory is None:
+        _operational_session_factory = build_session_factory()
+    return _operational_session_factory
+
+
+REMINDER_WORKER_INTERVAL_SEC = int(os.getenv('REMINDER_WORKER_INTERVAL_SEC', '900'))
+
+
+def _compute_patient_projection_sync(uctsm_patient_id: str, today_value):
+    """Runs on the threadpool: open a SQL session, evaluate, project.
+
+    Doc s15: the schedule engine could already calculate reminders
+    (app.services.schedule_projection.project); nothing ever consumed them.
+    This is that consumer's SQL half - the Mongo half (who to notify, what
+    was already sent) stays in the async caller, which is the only place
+    that can touch both databases.
+    """
+    from app.db import models as _sql_db
+    from app.services.reminder_delivery import compute_patient_projection
+
+    with _operational_factory()() as session:
+        patient = session.get(_sql_db.Patient, uuid.UUID(str(uctsm_patient_id)))
+        if patient is None:
+            return None
+        return compute_patient_projection(session, patient, today=today_value)
+
+
+async def _sync_reminders_for_one_patient(patient_doc: dict) -> None:
+    """One patient's worker pass: compute, diff against what was sent, write."""
+    from app.services.reminder_delivery import sync_patient_reminders
+
+    uctsm_patient_id = patient_doc.get('uctsm_patient_id')
+    if not uctsm_patient_id:
+        return  # not yet linked to a canonical, evaluated schedule.
+
+    # A reminder needs a login account to notify - a patient who has not yet
+    # accepted their invite has nowhere for it to land. Mirrors the same
+    # user_id-or-email resolution _patient_chat_assignment already uses.
+    target_user_id = patient_doc.get('user_id')
+    if not target_user_id and patient_doc.get('email'):
+        matched = await db.users.find_one(
+            {'email': patient_doc['email'], 'role': 'patient'}, {'_id': 0, 'id': 1})
+        target_user_id = matched['id'] if matched else None
+    if not target_user_id:
+        return
+
+    projection = await run_in_threadpool(
+        _compute_patient_projection_sync, uctsm_patient_id, now().date())
+    if projection is None:
+        return
+
+    existing = await db.notifications.find(
+        {'patient_id': patient_doc['id'], 'type': 'visit_reminder',
+         'withdrawn': {'$ne': True}},
+        {'_id': 0, 'reminder_key': 1},
+    ).to_list(500)
+    existing_keys = [item['reminder_key'] for item in existing if item.get('reminder_key')]
+
+    outcome = sync_patient_reminders(
+        user_id=target_user_id, patient_id=patient_doc['id'],
+        trial_id=patient_doc['trial_id'], projection=projection,
+        existing_keys=existing_keys, now=now(),
+    )
+    if outcome.to_create:
+        await db.notifications.insert_many(outcome.to_create)
+    if outcome.to_withdraw_keys:
+        await db.notifications.update_many(
+            {'patient_id': patient_doc['id'], 'reminder_key': {'$in': outcome.to_withdraw_keys}},
+            {'$set': {'withdrawn': True, 'read': True}},
+        )
+
+
+async def sync_all_patient_reminders() -> None:
+    """One pass over every canonically-linked patient. Never raises past a
+    single patient's own failure - one bad record must not stop everyone
+    else's reminders from being recalculated."""
+    patients = await db.patients.find(
+        {'uctsm_patient_id': {'$exists': True, '$ne': None}}, {'_id': 0},
+    ).to_list(5000)
+    for patient_doc in patients:
+        try:
+            await _sync_reminders_for_one_patient(patient_doc)
+        except Exception:
+            logging.exception(
+                'Reminder sync failed for patient %s', patient_doc.get('id'))
+
+
+async def reminder_worker_loop():
+    """Long-running startup task: keep in-app reminders current (doc s15)."""
+    while True:
+        try:
+            await sync_all_patient_reminders()
+        except Exception:
+            logging.exception('Reminder worker pass failed')
+        await asyncio.sleep(REMINDER_WORKER_INTERVAL_SEC)
+
+
+def _link_operational_trial_sync(
+    organization_id: str, external_trial_id: str, body: UctsmTrialLinkIn,
+) -> dict:
+    with _operational_factory()() as session:
+        result = OperationalBridgeService(session).validate_trial_link(
+            organization_id=_canonical_uuid(organization_id, 'organization_id'),
+            external_trial_id=external_trial_id,
+            external_schedule_definition_id=(
+                body.external_schedule_definition_id or external_trial_id
+            ),
+            trial_id=_canonical_uuid(body.canonical_trial_id, 'canonical_trial_id'),
+            schedule_definition_id=_canonical_uuid(
+                body.schedule_definition_id, 'schedule_definition_id'),
+        )
+        session.commit()
+        return result
+
+
+def _enroll_operational_patient_sync(
+    *, organization_id: str, actor_id: str, trial: dict, patient: dict,
+    baseline: date, horizon: date,
+):
+    with _operational_factory()() as session:
+        enrollment = OperationalBridgeService(session).enroll_patient(
+            organization_id=_canonical_uuid(organization_id, 'organization_id'),
+            actor_id=_canonical_uuid(actor_id, 'actor_id'),
+            canonical_trial_id=_canonical_uuid(
+                trial.get('uctsm_trial_id'), 'uctsm_trial_id'),
+            schedule_definition_id=_canonical_uuid(
+                trial.get('uctsm_schedule_definition_id'),
+                'uctsm_schedule_definition_id',
+            ),
+            external_patient_id=patient['id'],
+            patient_code=(patient.get('subject_id') or patient['id']),
+            baseline_date=baseline,
+            horizon=horizon,
+            arm_label=patient.get('arm_label'),
+            cohort_label=patient.get('cohort_label'),
+            dimension_values=patient.get('dimension_values') or {},
+        )
+        session.commit()
+        return enrollment
+
+
+def _parse_baseline_date(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if not value:
+        raise ValueError('baseline_date is required for a canonical schedule')
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00')).date()
+    except (TypeError, ValueError) as exc:
+        raise ValueError('baseline_date must be an ISO 8601 date') from exc
+
+
+async def _project_operational_enrollment(
+    patient: dict, trial: dict, user: dict,
+) -> int:
+    """Assign and evaluate one linked patient, then refresh the Mongo read model."""
+    if not trial.get('uctsm_trial_id'):
+        if os.getenv('UCTSM_AUTHORITATIVE', '').strip().lower() in {'1', 'true', 'yes'}:
+            raise HTTPException(
+                409,
+                'This trial is not linked to an approved canonical schedule. '
+                'Link it before enrolling patients.',
+            )
+        return -1
+    if not trial.get('uctsm_schedule_definition_id'):
+        raise HTTPException(409, 'The canonical trial link has no schedule definition')
+    organization = await find_organization_by_name(user.get('organization'))
+    if not organization or not organization.get('id'):
+        raise HTTPException(403, 'No organization context is available')
+    try:
+        baseline = _parse_baseline_date(patient.get('baseline_date'))
+        horizon = max(baseline, now().date()) + timedelta(days=366)
+        enrollment = await run_in_threadpool(
+            _enroll_operational_patient_sync,
+            organization_id=organization['id'], actor_id=user['id'],
+            trial=trial, patient=patient, baseline=baseline, horizon=horizon,
+        )
+    except HTTPException:
+        raise
+    except (KeyError, RuntimeError, ValueError) as exc:
+        await db.patients.update_one({'id': patient['id']}, {'$set': {
+            'schedule_assignment_status': 'error',
+            'schedule_assignment_error': str(exc),
+            'schedule_assignment_updated_at': now(),
+        }})
+        raise HTTPException(
+            409,
+            f'Canonical schedule assignment failed: {exc}. '
+            'No legacy schedule was materialized; correct the link/input and retry.',
+        ) from exc
+
+    generated_at = now()
+    documents = bridge_visit_documents(
+        patient_id=patient['id'], trial_id=trial['id'],
+        schedule_version_id=str(enrollment.schedule_version_id),
+        evaluation_id=str(enrollment.evaluation_id), events=enrollment.events,
+        generated_at=generated_at,
+    )
+    active_ids = []
+    for row in documents:
+        event_id = row['uctsm_patient_event_id']
+        active_ids.append(event_id)
+        created_at = row.pop('created_at')
+        await db.visit_instances.update_one(
+            {'patient_id': patient['id'], 'uctsm_patient_event_id': event_id},
+            {
+                '$set': row,
+                '$setOnInsert': {'id': event_id, 'created_at': created_at},
+            },
+            upsert=True,
+        )
+    obsolete_filter = {
+        'patient_id': patient['id'],
+        'uctsm_source_of_truth': True,
+        'uctsm_patient_event_id': {'$nin': active_ids},
+        'operational_status': {'$nin': ['completed', 'cancelled']},
+    }
+    await db.visit_instances.update_many(obsolete_filter, {'$set': {
+        'status': 'cancelled', 'operational_status': 'cancelled',
+        'canonical_status': 'CANCELLED',
+        'manual_review_reason': 'Removed by canonical schedule reconciliation',
+        'updated_at': generated_at,
+    }})
+    await db.patients.update_one({'id': patient['id']}, {'$set': {
+        'uctsm_patient_id': str(enrollment.patient_id),
+        'assigned_schedule_version_id': str(enrollment.schedule_version_id),
+        'uctsm_evaluation_id': str(enrollment.evaluation_id),
+        'schedule_assignment_status': 'assigned',
+        'schedule_assignment_error': '',
+        'schedule_assignment_updated_at': generated_at,
+    }})
+    patient.update({
+        'uctsm_patient_id': str(enrollment.patient_id),
+        'assigned_schedule_version_id': str(enrollment.schedule_version_id),
+        'uctsm_evaluation_id': str(enrollment.evaluation_id),
+        'schedule_assignment_status': 'assigned',
+        'schedule_assignment_error': '',
+        'schedule_assignment_updated_at': generated_at,
+    })
+    return len(documents)
+
+
+def _list_canonical_schedules_sync(organization_id: str, external_trial_id: str):
+    from app.services.canonical_bridge import list_schedule_versions
+
+    with _operational_factory()() as session:
+        return [
+            {
+                'schedule_definition_id': str(row.schedule_definition_id),
+                'schedule_version_id': str(row.schedule_version_id),
+                'name': row.name,
+                'schedule_type': row.schedule_type,
+                'version_number': row.version_number,
+                'status': row.status,
+                'protocol_version_label': row.protocol_version_label,
+                'effective_from': row.effective_from,
+                'approved_at': row.approved_at,
+                'is_current_protocol_version': row.is_current_protocol_version,
+                'patients': row.patients,
+            }
+            for row in list_schedule_versions(
+                session,
+                organization_id=_canonical_uuid(organization_id, 'organization_id'),
+                external_trial_id=external_trial_id,
+            )
+        ]
+
+
+@api.get('/trials/{trial_id}/uctsm-schedule',
+         dependencies=[Depends(require_roles('sponsor', 'cro', 'pi', 'crc'))])
+async def get_canonical_schedules(trial_id: str, user=Depends(current_user)):
+    """Protocol/schedule versions for this trial, newest first (doc 9, Case 10).
+
+    Superseded versions are included on purpose: patients enrolled under one stay
+    on it, so a site has to be able to see which schedule each patient is on.
+    """
+    trial = await db.trials.find_one({'id': trial_id}, {'_id': 0})
+    if not trial:
+        raise HTTPException(404, 'Trial not found')
+    if not await _can_access_trial(user, trial):
+        raise HTTPException(403, 'You do not have access to this trial')
+    organization = await find_organization_by_name(user.get('organization'))
+    if not organization or not organization.get('id'):
+        raise HTTPException(403, 'No organization context is available')
+    try:
+        schedules = await run_in_threadpool(
+            _list_canonical_schedules_sync, organization['id'], trial_id)
+    except (KeyError, RuntimeError, ValueError) as exc:
+        raise HTTPException(409, f'Canonical schedule lookup failed: {exc}') from exc
+    return serialize({
+        'trial_id': trial_id,
+        'uctsm_trial_id': trial.get('uctsm_trial_id'),
+        'approved_schedule_version_id': trial.get('uctsm_approved_schedule_version_id'),
+        'draft_schedule_version_id': trial.get('uctsm_draft_schedule_version_id'),
+        'schedules': schedules,
+    })
+
+
+@api.post('/trials/{trial_id}/uctsm-link',
+          dependencies=[Depends(require_roles('sponsor', 'cro'))])
+async def link_trial_to_uctsm(
+    trial_id: str, body: UctsmTrialLinkIn, user=Depends(current_user),
+):
+    """Explicitly bind an operational trial to one approved canonical schedule."""
+    trial = await db.trials.find_one({'id': trial_id}, {'_id': 0})
+    if not trial:
+        raise HTTPException(404, 'Trial not found')
+    if not await _can_access_trial(user, trial):
+        raise HTTPException(403, 'You do not have access to this trial')
+    organization = await find_organization_by_name(user.get('organization'))
+    if not organization or not organization.get('id'):
+        raise HTTPException(403, 'No organization context is available')
+    try:
+        linked = await run_in_threadpool(
+            _link_operational_trial_sync,
+            organization['id'], trial_id, body,
+        )
+    except (KeyError, RuntimeError, ValueError) as exc:
+        raise HTTPException(409, f'Canonical trial link failed: {exc}') from exc
+    link_fields = {
+        'uctsm_trial_id': linked['trial_id'],
+        'uctsm_schedule_definition_id': linked['schedule_definition_id'],
+        'uctsm_approved_schedule_version_id': linked['schedule_version_id'],
+        'uctsm_link_status': 'active',
+        'uctsm_linked_at': now(),
+        'uctsm_linked_by': user['id'],
+    }
+    await db.trials.update_one({'id': trial_id}, {'$set': link_fields})
+    await write_audit(
+        user, 'trial.uctsm_link',
+        f'Linked trial {trial_id} to approved canonical schedule '
+        f'{linked["schedule_version_id"]}',
+        target_id=trial_id, trial_id=trial_id,
+    )
+    return serialize({'trial_id': trial_id, **link_fields})
+
+
+def _import_canonical_schedules_sync(
+    organization_id: str, actor_id: str, trial: dict, definitions: list[dict],
+):
+    from app.services.canonical_bridge import import_schedule_definitions
+
+    with _operational_factory()() as session:
+        canonical_trial, imported = import_schedule_definitions(
+            session,
+            organization_id=_canonical_uuid(organization_id, 'organization_id'),
+            actor_id=_canonical_uuid(actor_id, 'actor_id'),
+            external_trial_id=trial['id'],
+            protocol_number=(trial.get('protocol_id') or trial['id']),
+            study_title=trial.get('title'),
+            definitions=definitions,
+        )
+        session.commit()
+        return str(canonical_trial.id), [
+            {
+                'external_schedule_definition_id': item.external_schedule_definition_id,
+                'schedule_definition_id': str(item.schedule_definition_id),
+                'schedule_version_id': str(item.schedule_version_id),
+                'version_number': item.version_number,
+                'status': item.status,
+                'name': item.name,
+                'created': item.created,
+            }
+            for item in imported
+        ]
+
+
+@api.post('/trials/{trial_id}/uctsm-schedule',
+          dependencies=[Depends(require_roles('sponsor', 'cro', 'pi'))])
+async def build_canonical_schedule(trial_id: str, user=Depends(current_user)):
+    """Turn this trial's extracted schedule into canonical draft versions.
+
+    This is the join that makes UCTSM the scheduling system for a newly created
+    trial: Add Trial extracts once, and the same plan becomes the canonical
+    schedule the Sponsor/PI reviews, approves and enrols patients onto. It never
+    approves anything - the draft lands in VALIDATION_REQUIRED for human review.
+    """
+    trial = await db.trials.find_one({'id': trial_id}, {'_id': 0})
+    if not trial:
+        raise HTTPException(404, 'Trial not found')
+    if not await _can_access_trial(user, trial):
+        raise HTTPException(403, 'You do not have access to this trial')
+    organization = await find_organization_by_name(user.get('organization'))
+    if not organization or not organization.get('id'):
+        raise HTTPException(403, 'No organization context is available')
+
+    definitions = await db.schedule_definitions.find(
+        {'trial_id': trial_id}, {'_id': 0}).sort('created_at', 1).to_list(50)
+    if not definitions:
+        raise HTTPException(
+            409,
+            'This trial has no extracted protocol schedule yet. Upload the '
+            'protocol and complete extraction before building the schedule.',
+        )
+    for definition in definitions:
+        source_id = definition.get('source_extraction_id')
+        if not source_id:
+            continue
+        extraction = await db.protocol_extractions.find_one(
+            {'id': source_id}, {'_id': 0, 'option_label': 1, 'option_description': 1,
+                                'file_name': 1})
+        if extraction:
+            definition.update({
+                'option_label': extraction.get('option_label') or '',
+                'option_description': extraction.get('option_description') or '',
+                'file_name': extraction.get('file_name') or 'protocol.pdf',
+            })
+
+    try:
+        canonical_trial_id, imported = await run_in_threadpool(
+            _import_canonical_schedules_sync,
+            organization['id'], user['id'], trial, definitions,
+        )
+    except (KeyError, RuntimeError, ValueError) as exc:
+        raise HTTPException(409, f'Canonical schedule import failed: {exc}') from exc
+
+    if not imported:
+        raise HTTPException(
+            409,
+            'The extracted schedule has no visits to build a canonical schedule '
+            'from. Review the extraction before continuing.',
+        )
+    primary = imported[0]
+    await db.trials.update_one({'id': trial_id}, {'$set': {
+        'uctsm_trial_id': canonical_trial_id,
+        'uctsm_schedule_definition_id': primary['schedule_definition_id'],
+        'uctsm_draft_schedule_version_id': primary['schedule_version_id'],
+        'uctsm_link_status': trial.get('uctsm_link_status') or 'draft',
+        'uctsm_schedule_built_at': now(),
+    }})
+    if any(item['created'] for item in imported):
+        await write_audit(
+            user, 'trial.uctsm_schedule_build',
+            f'Built {len(imported)} canonical schedule draft(s) for '
+            f'{trial.get("protocol_id") or trial_id}',
+            target_id=trial_id, trial_id=trial_id,
+        )
+    return serialize({
+        'trial_id': trial_id,
+        'uctsm_trial_id': canonical_trial_id,
+        'schedules': imported,
+    })
+
+
+@api.get('/trials/{trial_id}/uctsm-link',
+         dependencies=[Depends(require_roles('sponsor', 'cro', 'pi', 'crc', 'smo', 'site'))])
+async def get_trial_uctsm_link(trial_id: str, user=Depends(current_user)):
+    """Expose linkage/readiness and patient migration counts without changing data."""
+    trial = await db.trials.find_one({'id': trial_id}, {'_id': 0})
+    if not trial:
+        raise HTTPException(404, 'Trial not found')
+    if not await _can_access_trial(user, trial):
+        raise HTTPException(403, 'You do not have access to this trial')
+    total = await db.patients.count_documents({'trial_id': trial_id})
+    assigned = await db.patients.count_documents({
+        'trial_id': trial_id, 'schedule_assignment_status': 'assigned',
+    })
+    assignment_errors = await db.patients.count_documents({
+        'trial_id': trial_id, 'schedule_assignment_status': 'error',
+    })
+    legacy_instances = await db.visit_instances.count_documents({
+        'trial_id': trial_id, 'uctsm_source_of_truth': {'$ne': True},
+    })
+    return serialize({
+        'trial_id': trial_id,
+        'status': trial.get('uctsm_link_status') or 'unlinked',
+        'uctsm_trial_id': trial.get('uctsm_trial_id'),
+        'schedule_definition_id': trial.get('uctsm_schedule_definition_id'),
+        'approved_schedule_version_id': trial.get('uctsm_approved_schedule_version_id'),
+        'patients': {
+            'total': total, 'assigned': assigned,
+            'unassigned': max(0, total - assigned - assignment_errors),
+            'errors': assignment_errors,
+        },
+        'legacy_visit_instances_requiring_explicit_migration': legacy_instances,
+        'ready_for_authoritative_enrollment': bool(
+            trial.get('uctsm_trial_id') and trial.get('uctsm_schedule_definition_id')
+        ),
+    })
+
+
 @api.get('/patients')
 async def list_patients(user=Depends(require_roles('sponsor', 'cro', 'pi', 'crc'))):
     if user['role'] == 'pi':
@@ -5375,6 +6058,18 @@ async def add_patient(body: PatientIn, user=Depends(current_user)):
         raise HTTPException(404, 'Trial not found')
     if not await _can_access_trial(user, trial):
         raise HTTPException(403, 'You do not have access to enroll patients in this trial')
+    authoritative = os.getenv('UCTSM_AUTHORITATIVE', '').strip().lower() in {'1', 'true', 'yes'}
+    if authoritative and not trial.get('uctsm_trial_id'):
+        raise HTTPException(
+            409,
+            'This trial is not linked to an approved canonical schedule. '
+            'Link it before enrolling patients.',
+        )
+    if trial.get('uctsm_trial_id'):
+        try:
+            _parse_baseline_date(body.baseline_date)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     caller_org = (user.get('organization') or '').strip()
     if user['role'] in ('smo', 'site'):
@@ -5401,11 +6096,17 @@ async def add_patient(body: PatientIn, user=Depends(current_user)):
                 return colleague['id']
         return None
 
-    if not pi_id:
+    # An SMO/site organisation admin is not a clinician and enrols on someone
+    # else's behalf, so the PI who carries responsibility for this patient has
+    # to be named deliberately. Defaulting first made the guard below
+    # unreachable: a colleague was silently assigned a patient they had never
+    # accepted, and the enroller saw a 200 as though they had chosen one.
+    enroller_is_org_admin = user['role'] in ('smo', 'site')
+    if not pi_id and not enroller_is_org_admin:
         pi_id = await default_trial_staff('pi', 'pi_id')
     if not crc_id:
         crc_id = await default_trial_staff('crc', 'crc_id')
-    if user['role'] in ('smo', 'site') and not pi_id:
+    if enroller_is_org_admin and not pi_id:
         raise HTTPException(400, 'Select the PI responsible for this patient')
     for staff_id, expected_role, label in (
         (pi_id, 'pi', 'PI'), (crc_id, 'crc', 'CRC'),
@@ -5440,10 +6141,14 @@ async def add_patient(body: PatientIn, user=Depends(current_user)):
         'avatar_initials': patient_initials(body.avatar_initials, body.full_name),
     }
     await db.patients.insert_one(doc)
-    created = await materialize_visit_instances(doc)
+    created = await _project_operational_enrollment(doc, trial, user)
+    schedule_source = 'canonical UCTSM'
+    if created < 0:
+        created = await materialize_visit_instances(doc)
+        schedule_source = 'legacy templates'
     await write_audit(user, 'patient.enroll',
                       f"Enrolled {doc['full_name']} in trial {doc['trial_id']} "
-                      f"({created} visit instance(s) materialized)",
+                      f"({created} visit instance(s) materialized from {schedule_source})",
                       target_id=pid, trial_id=doc['trial_id'])
     return serialize(doc)
 
@@ -5509,6 +6214,18 @@ async def invite_patient_for_enrollment(body: PatientInvitationIn, user=Depends(
         raise HTTPException(404, 'Trial not found')
     if not await _can_access_trial(user, trial):
         raise HTTPException(403, 'You do not have access to enroll patients in this trial')
+    authoritative = os.getenv('UCTSM_AUTHORITATIVE', '').strip().lower() in {'1', 'true', 'yes'}
+    if authoritative and not trial.get('uctsm_trial_id'):
+        raise HTTPException(
+            409,
+            'This trial is not linked to an approved canonical schedule. '
+            'Link it before inviting patients.',
+        )
+    if trial.get('uctsm_trial_id'):
+        try:
+            _parse_baseline_date(body.baseline_date)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     caller_org = (user.get('organization') or '').strip()
     if user['role'] in ('smo', 'site') and not user.get('org_admin'):
@@ -5531,11 +6248,17 @@ async def invite_patient_for_enrollment(body: PatientInvitationIn, user=Depends(
                 return colleague['id']
         return None
 
-    if not pi_id:
+    # An SMO/site organisation admin is not a clinician and enrols on someone
+    # else's behalf, so the PI who carries responsibility for this patient has
+    # to be named deliberately. Defaulting first made the guard below
+    # unreachable: a colleague was silently assigned a patient they had never
+    # accepted, and the enroller saw a 200 as though they had chosen one.
+    enroller_is_org_admin = user['role'] in ('smo', 'site')
+    if not pi_id and not enroller_is_org_admin:
         pi_id = await default_trial_staff('pi', 'pi_id')
     if not crc_id:
         crc_id = await default_trial_staff('crc', 'crc_id')
-    if user['role'] in ('smo', 'site') and not pi_id:
+    if enroller_is_org_admin and not pi_id:
         raise HTTPException(400, 'Select the PI responsible for this patient')
     for staff_id, expected_role, label in (
         (pi_id, 'pi', 'PI'),
@@ -5623,17 +6346,166 @@ async def get_patient(patient_id: str, user=Depends(require_roles('sponsor', 'cr
     """Patient detail: the patient record + its trial + its visit instances."""
     p = await _require_patient(user, patient_id)
     trial = await db.trials.find_one({'id': p.get('trial_id')}, {'_id': 0})
-    raw_instances = await db.visit_instances.find({'patient_id': patient_id}, {'_id': 0}) \
-                                            .sort('seq', 1).to_list(500)
+    raw_instances = _order_visit_instances(
+        await db.visit_instances.find({'patient_id': patient_id}, {'_id': 0}).to_list(500))
     instances = [await _ensure_visit_instance_workflow(row) for row in raw_instances]
     return {**p, 'trial': trial, 'instances': instances}
+
+
+@api.post('/patients/{patient_id}/uctsm-reconcile',
+          dependencies=[Depends(require_roles('pi', 'crc', 'smo', 'site'))])
+async def reconcile_patient_uctsm(patient_id: str, user=Depends(current_user)):
+    """Retry a failed/idempotent canonical projection; never migrates legacy rows silently."""
+    patient = await db.patients.find_one({'id': patient_id}, {'_id': 0})
+    if not patient:
+        raise HTTPException(404, 'Patient not found')
+    trial = await db.trials.find_one({'id': patient.get('trial_id')}, {'_id': 0})
+    if not trial:
+        raise HTTPException(404, 'Trial not found')
+    if not await _can_access_trial(user, trial):
+        raise HTTPException(403, 'You do not have access to this patient')
+    legacy_count = await db.visit_instances.count_documents({
+        'patient_id': patient_id, 'uctsm_source_of_truth': {'$ne': True},
+    })
+    if legacy_count and not patient.get('uctsm_patient_id'):
+        raise HTTPException(
+            409,
+            f'{legacy_count} legacy visit instance(s) require an explicit migration '
+            'impact preview; automatic reconciliation is blocked.',
+        )
+    created = await _project_operational_enrollment(patient, trial, user)
+    if created < 0:
+        raise HTTPException(409, 'Trial is not linked to a canonical schedule')
+    await write_audit(
+        user, 'patient.uctsm_reconcile',
+        f'Reconciled {created} canonical schedule event(s)',
+        target_id=patient_id, trial_id=patient['trial_id'],
+    )
+    return {
+        'patient_id': patient_id, 'status': 'assigned',
+        'projected_events': created,
+        'uctsm_patient_id': patient.get('uctsm_patient_id'),
+        'schedule_version_id': patient.get('assigned_schedule_version_id'),
+    }
 
 @api.get('/patients/{patient_id}/visits')
 async def get_patient_visits(patient_id: str, user=Depends(require_roles('sponsor', 'cro', 'pi', 'crc'))):
     await _require_patient(user, patient_id)
-    rows = await db.visit_instances.find({'patient_id': patient_id}, {'_id': 0}) \
-                                   .sort('seq', 1).to_list(500)
+    rows = _order_visit_instances(
+        await db.visit_instances.find({'patient_id': patient_id}, {'_id': 0}).to_list(500))
+    patient = await db.patients.find_one({'id': patient_id}, {'_id': 0})
+    rows = await _apply_canonical_dates(patient, rows)
     return [await _ensure_visit_instance_workflow(row) for row in rows]
+
+
+class PatientVisitIn(BaseModel):
+    """An extra, one-off visit added to a single patient's own schedule.
+
+    This is the unscheduled/ad-hoc case — an unplanned safety check, a repeat
+    lab, a re-consent — not a protocol amendment. It is added against a
+    calendar date the site already knows, so it slots into the timeline
+    between the protocol visits it falls between rather than at either end.
+    """
+    name: str = Field(min_length=1, max_length=200)
+    scheduled_date: str
+    visit_type: Literal['Hospital', 'Phone', 'Remote', 'Home'] = 'Hospital'
+    window_days: int = Field(default=0, ge=0, le=365)
+    note: Optional[str] = Field(default=None, max_length=2000)
+    activities: List[str] = Field(default_factory=list)
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+@api.post('/patients/{patient_id}/visits', status_code=201)
+async def add_patient_visit(patient_id: str, body: PatientVisitIn,
+                            user=Depends(require_roles('pi', 'crc'))):
+    """Add one extra dated visit to THIS patient's schedule.
+
+    Never touches the trial's visit templates, so no other patient is
+    affected. The visit is placed by its date: `_insertion_seq` gives it an
+    ordering number between its two dated neighbours, so it reads as an
+    insertion into the middle of the schedule and every protocol visit keeps
+    the number the site already knows it by.
+    """
+    patient = await _require_patient(user, patient_id)
+    try:
+        scheduled = datetime.fromisoformat(body.scheduled_date.replace('Z', '+00:00'))
+    except ValueError:
+        raise HTTPException(400, 'scheduled_date must be an ISO 8601 date/datetime')
+    if scheduled.tzinfo is None:
+        scheduled = scheduled.replace(tzinfo=timezone.utc)
+    existing = await db.visit_instances.find(
+        {'patient_id': patient_id}, {'_id': 0}).to_list(500)
+    window_start, window_end = _schedule_window({'window_days': body.window_days}, scheduled)
+    activities = [item.strip() for item in body.activities if item and item.strip()]
+    n = now()
+    visit_id = str(uuid.uuid4())
+    doc = {
+        'id': visit_id,
+        'patient_id': patient_id,
+        'trial_id': patient.get('trial_id'),
+        # No template: this visit exists for this patient only.
+        'visit_template_id': None,
+        'name': body.name.strip(),
+        'seq': _insertion_seq(existing, scheduled),
+        'visit_number': None,
+        'unscheduled': True,
+        'unscheduled_reason': (body.reason or '').strip(),
+        'activities': activities,
+        'procedures': [],
+        'visit_type': body.visit_type,
+        'location': '',
+        'window_days': body.window_days,
+        'scheduled_date': scheduled,
+        'scheduled_end': None,
+        'window_start': window_start,
+        'window_end': window_end,
+        'status': 'planned',
+        'operational_status': 'planned',
+        'manual_review_reason': '',
+        'note': (body.note or '').strip(),
+        # No template to derive stable task ids from — the instance's own id
+        # is the stable namespace for this one-off visit's tasks.
+        'clinical_tasks': _visit_task_snapshot(
+            {'id': visit_id}, 'clinical', activities),
+        'admin_tasks': [],
+        'comments': [],
+        'created_by': user['id'],
+        'updated_by': user['id'],
+        'updated_at': n,
+        'created_at': n,
+    }
+    await db.visit_instances.insert_one(doc)
+    await write_audit(
+        user, 'visit_instance.add_unscheduled',
+        f"Added unscheduled visit '{doc['name']}' on {iso(scheduled)} for patient {patient_id}",
+        target_id=doc['id'], patient_id=patient_id, trial_id=patient.get('trial_id'),
+        changes={'name': doc['name'], 'scheduled_date': iso(scheduled),
+                 'seq': doc['seq'], 'reason': doc['unscheduled_reason']})
+    return await _ensure_visit_instance_workflow(
+        await db.visit_instances.find_one({'id': doc['id']}, {'_id': 0}))
+
+
+@api.delete('/patients/{patient_id}/visits/{instance_id}')
+async def delete_patient_visit(patient_id: str, instance_id: str,
+                               user=Depends(require_roles('pi', 'crc'))):
+    """Remove an extra visit that was added by mistake.
+
+    Only ever an added (`unscheduled`) visit — a protocol visit belongs to the
+    approved schedule and is cancelled through its status, never deleted."""
+    await _require_patient(user, patient_id)
+    inst = await db.visit_instances.find_one(
+        {'id': instance_id, 'patient_id': patient_id}, {'_id': 0})
+    if not inst:
+        raise HTTPException(404, 'Visit instance not found')
+    if not inst.get('unscheduled'):
+        raise HTTPException(409, 'Protocol visits cannot be deleted; cancel the visit instead')
+    await db.visit_instances.delete_one({'id': instance_id})
+    await write_audit(
+        user, 'visit_instance.delete_unscheduled',
+        f"Removed unscheduled visit '{inst.get('name', '')}' for patient {patient_id}",
+        target_id=instance_id, patient_id=patient_id, trial_id=inst.get('trial_id'))
+    return {'ok': True}
+
 
 # ── Organizations directory ─────────────────────────────────────────────────
 @api.get('/organizations')
@@ -5829,12 +6701,19 @@ async def organization_platform_contact(org_id: str):
 # ── Notifications ───────────────────────────────────────────────────────────
 @api.get('/notifications')
 async def my_notifications(user=Depends(current_user)):
-    items = await db.notifications.find({'user_id': user['id']}, {'_id': 0}).sort('created_at', -1).to_list(100)
+    # 'withdrawn' only exists on schedule-reminder documents (doc s15): a
+    # moved or cancelled visit withdraws its old reminder rather than leaving
+    # it visible as if still due. Absent for every other notification type,
+    # so $ne True includes them unchanged.
+    items = await db.notifications.find(
+        {'user_id': user['id'], 'withdrawn': {'$ne': True}}, {'_id': 0},
+    ).sort('created_at', -1).to_list(100)
     return items
 
 @api.get('/notifications/unread-count')
 async def unread_notification_count(user=Depends(current_user)):
-    count = await db.notifications.count_documents({'user_id': user['id'], 'read': {'$ne': True}})
+    count = await db.notifications.count_documents(
+        {'user_id': user['id'], 'read': {'$ne': True}, 'withdrawn': {'$ne': True}})
     return {'count': count}
 
 @api.post('/notifications/read-all')
@@ -9644,6 +10523,8 @@ async def startup():
     asyncio.create_task(_migrate_organization_ownership())
     # Deliver due scheduled broadcasts exactly once (idempotent claim + fan-out).
     asyncio.create_task(admin_routes.broadcast_worker_loop())
+    # Doc s15: turn the schedule projection into actual in-app reminders.
+    asyncio.create_task(reminder_worker_loop())
 
 @app.on_event('shutdown')
 async def shutdown(): client.close()

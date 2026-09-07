@@ -747,14 +747,33 @@ export default function TrialSummary() {
           <Section
             title="Visit schedule"
             icon={CalendarDays}
-            action={sponsorLike ? (
-              <Pressable
-                onPress={() => router.push({ pathname: "/(app)/sponsor/visit-schedule", params: { id: trial.id } })}
-                style={s.inlineAction}
-              >
-                <Text style={s.inlineActionText}>Edit Schedule</Text>
-              </Pressable>
-            ) : undefined}
+            action={(
+              <View style={s.scheduleActions}>
+                {/* Screen H: which protocol/schedule version this trial's
+                    patients are on. Visible to every role that can read the
+                    trial, because a site has to be able to answer it too. */}
+                <Pressable
+                  testID="open-schedule-versions"
+                  accessibilityRole="button"
+                  accessibilityLabel="Open protocol and schedule versions"
+                  onPress={() => router.push({
+                    pathname: "/(app)/sponsor/schedule-versions",
+                    params: { id: trial.id, trialName: trial.protocol_id || trial.title || "" },
+                  })}
+                  style={s.inlineAction}
+                >
+                  <Text style={s.inlineActionText}>Versions</Text>
+                </Pressable>
+                {sponsorLike ? (
+                  <Pressable
+                    onPress={() => router.push({ pathname: "/(app)/sponsor/visit-schedule", params: { id: trial.id } })}
+                    style={s.inlineAction}
+                  >
+                    <Text style={s.inlineActionText}>Edit Schedule</Text>
+                  </Pressable>
+                ) : null}
+              </View>
+            )}
           >
             {(trial.visits || []).length ? (trial.visits || []).map((visit, index) => (
               <View key={visit.id || `${visit.name}-${index}`} style={s.scheduleRow}>
@@ -1149,6 +1168,7 @@ const s = StyleSheet.create({
   sectionHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 },
   sectionIdentity: { flex: 1, flexDirection: "row", alignItems: "center", gap: 7 },
   sectionTitle: { fontFamily: fonts.semibold, fontSize: 12, color: colors.foreground },
+  scheduleActions: { flexDirection: "row", alignItems: "center", gap: 8 },
   inlineAction: { flexDirection: "row", alignItems: "center", gap: 4 },
   inlineActionText: { fontFamily: fonts.semibold, fontSize: 10.5, color: colors.info },
   metrics: { flexDirection: "row", gap: 8 },

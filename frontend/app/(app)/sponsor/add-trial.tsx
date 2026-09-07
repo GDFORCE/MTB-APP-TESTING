@@ -23,6 +23,7 @@ import {
   X,
 } from "lucide-react-native";
 import { api } from "@/src/api/client";
+import { buildCanonicalSchedule } from "@/src/features/uctsm/api";
 import { ScreenContainer, ScreenHeader } from "@/src/components/ScreenHeader";
 import { Button, Card, Small } from "@/src/components/ui";
 import {
@@ -274,13 +275,39 @@ export default function AddTrial() {
         status: details.status,
         recruitment_status: details.status === "active" ? "recruiting" : "closed",
       });
-      router.replace({
+      const trialId = response.data.id;
+      const legacyEditor = () => router.replace({
         pathname: "/(app)/sponsor/visit-schedule",
         params: {
-          id: response.data.id,
+          id: trialId,
           extractionIds: extractionIds.length ? extractionIds.join(",") : undefined,
         },
       });
+      // A newly created trial is scheduled by the canonical engine: the protocol
+      // just extracted becomes a DRAFT schedule version the sponsor reviews and
+      // approves, and that approved version is what patients are enrolled onto.
+      // Nothing here approves anything, and nothing reaches a patient yet.
+      if (!extractionIds.length) { legacyEditor(); return; }
+      try {
+        await Promise.all(extractionIds.map((extractionId) =>
+          api.post(`/trials/${trialId}/protocol-extractions/${extractionId}/consume`)));
+        const built = await buildCanonicalSchedule(trialId);
+        const version = built.schedules[0];
+        if (!version) throw new Error("No canonical schedule was produced");
+        router.replace({
+          pathname: "/(app)/sponsor/protocol-schedule",
+          params: {
+            id: trialId,
+            scheduleVersionId: version.schedule_version_id,
+            trialName: details.title.trim(),
+          },
+        });
+      } catch {
+        // The trial exists and its schedule was extracted; only the canonical
+        // build failed. Dropping the sponsor into the operational editor keeps
+        // the work rather than stranding a trial with no schedule at all.
+        legacyEditor();
+      }
     } catch (error: any) {
       setErr(error?.response?.data?.detail || "Could not save this trial.");
     } finally {

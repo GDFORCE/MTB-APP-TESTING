@@ -98,11 +98,20 @@ MAX_PDF_BYTES = 25 * 1024 * 1024
 # duration guard.
 MAX_OUTPUT_TOKENS = 24000
 
-# How far to expand a repetition the protocol leaves open-ended ("continue until
-# progression", "every 8th week thereafter"). Bounded so one vague protocol
-# cannot materialize thousands of visits per patient; always recorded as an
-# assumption for the reviewer.
-OPEN_ENDED_CYCLE_CAP = 12
+# How many occurrences of an open-ended repetition ("continue until progression",
+# "every 8th week thereafter") to SHOW for review.
+#
+# This is a display/performance preview limit, NOT the protocol schedule. The
+# protocol rule remains "repeat until the stopping criterion", and MTB must never
+# present occurrence N as the last one (requirement doc 3 section 36). Every
+# expansion that hits this limit records an explicit reviewer assumption saying so.
+#
+# Generating the real rolling patient horizon is the canonical engine's job
+# (app/domain/schedule/evaluator.py expands recurrence to an explicit horizon).
+OPEN_ENDED_PREVIEW_CYCLES = 4
+
+# Retained name for existing callers and tests; the value is a preview limit.
+OPEN_ENDED_CYCLE_CAP = OPEN_ENDED_PREVIEW_CYCLES
 
 # Sanity ceiling on a single expansion, independent of the cap above.
 MAX_EXPANDED_VISITS = 400
@@ -616,17 +625,22 @@ def _expand_blocks(schedule: ExtractedSchedule,
 
         to_cycle = block.to_cycle
         if to_cycle is None:
-            to_cycle = block.from_cycle + OPEN_ENDED_CYCLE_CAP - 1
+            to_cycle = block.from_cycle + OPEN_ENDED_PREVIEW_CYCLES - 1
             if schedule.total_cycles and schedule.total_cycles >= block.from_cycle:
+                # A protocol-stated maximum IS the schedule limit, so honour it.
                 to_cycle = schedule.total_cycles
                 assumptions.append(
                     f"Cycles {block.from_cycle}-{to_cycle} were expanded using the "
                     f"protocol's stated maximum of {schedule.total_cycles} cycles.")
             else:
+                # No stated maximum: what follows is a preview, not the schedule.
                 assumptions.append(
-                    f"The protocol leaves the schedule open-ended from cycle "
-                    f"{block.from_cycle}; expanded {OPEN_ENDED_CYCLE_CAP} cycles "
-                    f"(to cycle {to_cycle}). Confirm the real number before saving.")
+                    f"PREVIEW ONLY - the protocol leaves the schedule open-ended from "
+                    f"cycle {block.from_cycle}. The rows shown are the first "
+                    f"{OPEN_ENDED_PREVIEW_CYCLES} occurrences (to cycle {to_cycle}) for "
+                    f"review; cycle {to_cycle} is NOT the last cycle. The schedule "
+                    f"continues per the protocol until its stopping criteria are met. "
+                    f"Confirm the real number before saving.")
         if to_cycle < block.from_cycle:
             warnings.append(
                 f"Ignored a repeating block: last cycle ({to_cycle}) is before the "
@@ -714,7 +728,7 @@ def expand_schedule(schedule: ExtractedSchedule) -> ExtractedSchedule:
         # compatibility projection and any model-authored duplicate rows are ignored.
         projected, projection_warnings = project_canonical_plan(
             schedule.canonical_plan,
-            open_ended_preview_count=OPEN_ENDED_CYCLE_CAP,
+            open_ended_preview_count=OPEN_ENDED_PREVIEW_CYCLES,
             anchor_study_day=schedule.anchor_study_day,
             includes_day_zero=schedule.includes_day_zero,
         )

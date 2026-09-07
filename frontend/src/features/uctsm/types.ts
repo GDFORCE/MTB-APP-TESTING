@@ -30,6 +30,63 @@ export type ValidationIssue = {
   details: Record<string, unknown>;
 };
 
+export type Qualifier = {
+  id: string;
+  marker?: string;
+  text: string;
+  scope: string;
+  category: string;
+  target_codes: string[];
+  resolved: boolean;
+  evidence_refs: string[];
+};
+
+export type ScheduleActivity = {
+  id: string;
+  code?: string;
+  display_name: string;
+  activity_type: string;
+  requiredness: string;
+  sequence_number?: number;
+  timing?: Record<string, unknown> & { type?: string };
+  applicability?: unknown[];
+  qualifiers?: Qualifier[];
+};
+
+export type ConditionalDefinition = {
+  condition_code: string;
+  display_name: string;
+  protocol_label: string;
+  state: "NOT_OCCURRED" | "PENDING_CONFIRMATION" | "ACTIVE" | "RESOLVED"
+    | "NOT_APPLICABLE" | "CANCELLED";
+  occurrence_date?: string;
+  resolution_date?: string;
+  requires_review: boolean;
+  interpretation_status: InterpretationStatus;
+  actions: Array<{ action_type: string; target_code: string }>;
+  evidence_refs: string[];
+};
+
+export type PatientConditionsResponse = {
+  patient_id: string;
+  schedule_version_id?: string;
+  conditions: ConditionalDefinition[];
+};
+
+export type PatientActivity = {
+  id: string;
+  activity_definition_id: string;
+  activity_code?: string;
+  status: string;
+  requiredness: string;
+  sequence_number?: number;
+  planned_time?: string;
+  earliest_time?: string;
+  latest_time?: string;
+  actual_time?: string;
+  explanation?: Record<string, unknown>;
+};
+
 export type ScheduleEvent = {
   id: string;
   code: string;
@@ -40,8 +97,18 @@ export type ScheduleEvent = {
   applicability: unknown[];
   conditions: unknown[];
   dependencies: unknown[];
+  dependency_mode?: "NOMINAL" | "ACTUAL_PREVIOUS_EVENT" | "MANUAL" | "UNCLEAR";
+  /** Doc 10 s2-s3. Null when the protocol never stated a mode. */
+  visit_mode?: string | null;
+  /** Doc 10 s31-s32. Every mode a hybrid visit permits. */
+  allowed_visit_modes?: string[];
+  /** Doc 10 s13-s15. ON_DEMAND visits exist but are never due. */
+  activation?: "SCHEDULED" | "ON_DEMAND";
   recurrence?: Record<string, unknown>;
-  activities: Array<{ id: string; display_name: string; activity_type: string; requiredness: string }>;
+  conditional_actions?: unknown[];
+  qualifiers?: Qualifier[];
+  confinement?: Record<string, unknown>;
+  activities: ScheduleActivity[];
   evidence_refs: string[];
   interpretation_status: InterpretationStatus;
   requires_review: boolean;
@@ -95,8 +162,85 @@ export type PatientScheduleEvent = {
   nominal_end_date?: string;
   earliest_date?: string;
   latest_date?: string;
+  actual_date?: string;
   timing_resolution?: Record<string, unknown>;
+  activities?: PatientActivity[];
   explanation?: Record<string, unknown>;
+  /** Doc 10 s31-s32. Absent when the protocol never stated one. */
+  visit_mode?: string | null;
+  /** Doc 10 s14. Present only on a visit a site created on demand. */
+  unscheduled_reason?: string | null;
+};
+
+/**
+ * A repeat that continues past the occurrences that were materialized
+ * (requirement doc 3 s4 and s36). Without this the last row on screen reads as
+ * the end of the protocol, which it is not.
+ */
+/**
+ * The per-patient status of one anchor (requirement doc 1 s22). PLANNED and
+ * ACTUAL are deliberately separate: an expected date is not evidence the event
+ * happened.
+ */
+export type AnchorStatusView = {
+  anchor_code: string;
+  display_name: string;
+  status:
+    | "NOT_REQUIRED" | "AWAITING_EVENT" | "PLANNED"
+    | "ACTUAL" | "CONFIRMED" | "CORRECTED";
+  value?: string | null;
+  reason: string;
+  awaiting_event_code?: string | null;
+  confirmed: boolean;
+};
+
+/**
+ * One selectable enrolment dimension (requirement doc 8 s15-s18). ``blocked``
+ * means a parent choice is still outstanding, so nothing here can be picked yet.
+ */
+export type EnrolmentDimension = {
+  dimension_type: string;
+  display_name: string;
+  options: {
+    code: string;
+    display_name: string;
+    description?: string | null;
+    parent_dimension_type?: string | null;
+    parent_code?: string | null;
+  }[];
+  depends_on?: string | null;
+  blocked: boolean;
+  reason?: string | null;
+};
+
+/**
+ * One classified difference between schedule versions (requirement doc 9 s10).
+ * CLINICAL means it can affect a patient already on the study.
+ */
+export type TypedScheduleChange = {
+  change_type: string;
+  significance: "CLINICAL" | "ADMINISTRATIVE";
+  entity_type: string;
+  entity_code: string;
+  summary: string;
+  detail?: string | null;
+};
+
+export type ScheduleDiffResponse = {
+  added_events: string[];
+  removed_events: string[];
+  typed_changes?: TypedScheduleChange[];
+  clinically_significant_count?: number;
+};
+
+export type RepeatRuleSummary = {
+  event_code: string;
+  block_code?: string | null;
+  cadence: string;
+  termination: string;
+  materialized_count: number;
+  continues: boolean;
+  next_unmaterialized?: string | null;
 };
 
 export type PatientScheduleResponse = {
@@ -105,4 +249,5 @@ export type PatientScheduleResponse = {
   schedule_version_id?: string;
   evaluation_id?: string;
   events: PatientScheduleEvent[];
+  repeat_rules?: RepeatRuleSummary[];
 };

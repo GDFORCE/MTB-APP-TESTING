@@ -115,8 +115,20 @@ _UNIT_SYNONYMS = {
 
 
 class TemporalAmount(BaseModel):
-    value: float
+    value: float = Field(
+        description="The amount, or the LOWER bound when the protocol states a "
+        "range (e.g. 'every 3-4 months' -> value=3, value_max=4; 'every 1-2 "
+        "weeks' -> value=1, value_max=2). A single stated number has no "
+        "value_max.")
     unit: Literal["minute", "hour", "day", "week", "month", "year"]
+    value_max: float | None = Field(
+        default=None,
+        description="Set ONLY when the protocol states this interval as a "
+        "range rather than one fixed number (e.g. 'every 6-12 months'). Never "
+        "invented, never an average or a single picked bound — a range "
+        "collapsed to one number without recording the other bound here loses "
+        "real information a reviewer needs to see. null when the protocol "
+        "states one exact number.")
 
     @field_validator("unit", mode="before")
     @classmethod
@@ -203,6 +215,12 @@ class WindowSpec(BaseModel):
     early: TemporalAmount | None = None
     late: TemporalAmount | None = None
     source_label: str = ""
+    marker: str | None = Field(
+        default=None,
+        description="The EXACT footnote/table marker this window came from, as "
+        "printed (a superscript letter, number, or symbol). null when the window "
+        "is stated directly in the table/prose with no separate footnote marker.",
+    )
     evidence_ids: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
@@ -278,6 +296,13 @@ class ScheduleBranch(BaseModel):
 class ScheduleCondition(BaseModel):
     id: str
     expression: str
+    marker: str | None = Field(
+        default=None,
+        description="The EXACT footnote/table marker this condition came from, as "
+        "printed — a superscript letter ('a'), number ('1'), or symbol ('*', '†'). "
+        "null when the condition was stated in prose with no table marker. This is "
+        "the marker itself, not its meaning — 'expression' already holds the meaning.",
+    )
     applies_to_ids: list[str] = Field(default_factory=list)
     occurrence_numbers: list[int] = Field(
         default_factory=list,
@@ -292,6 +317,29 @@ class ScheduleCondition(BaseModel):
         "of duplicating the activity or event once per arm combination. Empty means "
         "every arm.",
     )
+    action_type: Literal[
+        "ADD_VISIT", "STOP_BRANCH", "PAUSE_TREATMENT", "RESUME_TREATMENT",
+        "REPEAT_VISIT", "ACTIVATE_EOT", "ACTIVATE_SAFETY_FOLLOWUP",
+        "ACTIVATE_SURVIVAL_FOLLOWUP", "MANUAL_REVIEW", "OTHER",
+    ] | None = Field(
+        default=None,
+        description="What the protocol says happens WHEN this condition applies — "
+        "the shape of the consequence, never a guess at whether/when it occurs for "
+        "any real patient. Use ADD_VISIT when the condition adds a visit named in "
+        "'applies_to_ids' (e.g. 'if progression, perform an unscheduled assessment'); "
+        "ACTIVATE_EOT / ACTIVATE_SAFETY_FOLLOWUP / ACTIVATE_SURVIVAL_FOLLOWUP for the "
+        "protocol's own end-of-treatment/follow-up visit named the same way; "
+        "MANUAL_REVIEW when the protocol describes a consequence with no clean visit "
+        "target (dose modification, PI discretion). null when the condition is "
+        "narrative with no clear structural consequence — leave it as a qualifier "
+        "rather than guessing a shape.",
+    )
+    resolution_expression: str | None = Field(
+        default=None,
+        description="The protocol's own words for when/how this condition ends or "
+        "resolves, e.g. 'until ANC recovers to >=1000' — verbatim, never inferred. "
+        "null when the protocol does not state a resolution.",
+    )
     evidence_ids: list[str] = Field(default_factory=list)
 
 
@@ -301,6 +349,12 @@ class ActivityTemplate(BaseModel):
     timing: TimingExpression | None = None
     window: WindowSpec | None = None
     conditional_text: str = ""
+    marker: str | None = Field(
+        default=None,
+        description="The EXACT footnote/table marker 'conditional_text' came from, "
+        "as printed (a superscript letter, number, or symbol next to this activity's "
+        "X in the table). null when conditional_text is prose with no table marker.",
+    )
     operational_constraints: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
 
@@ -326,6 +380,39 @@ class ScheduleEvent(BaseModel):
     activity_ids: list[str] = Field(default_factory=list)
     required: bool = True
     conditional_text: str = ""
+    marker: str | None = Field(
+        default=None,
+        description="The EXACT footnote/table marker 'conditional_text' came from, "
+        "as printed (a superscript letter, number, or symbol next to this visit's "
+        "column header or timing). null when conditional_text is prose with no "
+        "table marker.",
+    )
+    confinement_episode_id: str | None = Field(
+        default=None,
+        description="Doc s11. Set ONLY when the protocol describes this visit as "
+        "part of a SINGLE CONTINUOUS inpatient stay together with other visits — "
+        "e.g. 'Day -1 (admission)', 'Day 1 (dosing)', 'Day 2', 'Discharge' printed "
+        "as one confinement block, not as separate outpatient visits. Give every "
+        "visit in that same stay the SAME id (e.g. 'conf-cycle1'). null for an "
+        "ordinary visit, and null when the protocol does not explicitly say the "
+        "patient remains admitted between these rows — never inferred from visits "
+        "merely being on consecutive days.",
+    )
+    confinement_role: Literal["admission", "study_day", "dose", "discharge"] | None = Field(
+        default=None,
+        description="This visit's role within its confinement_episode_id. "
+        "'admission' the stay's start, 'dose' a day treatment is administered, "
+        "'discharge' the stay's end, 'study_day' any other in-stay day. Required "
+        "when confinement_episode_id is set; null otherwise.",
+    )
+    confinement_relative_day: int | None = Field(
+        default=None,
+        description="This visit's clinical day number WITHIN the confinement "
+        "episode, exactly as the protocol prints it (e.g. -1, 1, 2, 3) — never a "
+        "computed offset, and never 0 (clinical day numbering has no Day 0: the "
+        "day before dosing is -1, the dosing day is 1). null unless "
+        "confinement_episode_id is set.",
+    )
     operational_constraints: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
 
@@ -378,6 +465,226 @@ class CanonicalSchedulePlan(BaseModel):
     transitions: list[TransitionRule] = Field(default_factory=list)
     conditions: list[ScheduleCondition] = Field(default_factory=list)
     conflicts: list[ScheduleConflict] = Field(default_factory=list)
+
+
+# ───────────────────── one shared schedule origin ─────────────────────
+# Requirement doc s4. Day 0 is a clinical fact, and the flat projection, the
+# canonical adapter, patient enrolment and every date evaluation have to agree
+# on it or the same protocol row lands on two different calendar dates.
+#
+# The choice is made from the anchor's extracted SEMANTIC TYPE and from which
+# anchor the schedule's own events actually count from - never from an anchor's
+# printed name. "Baseline", "Day 1", "Randomisation" and "First Dose" are names
+# a protocol may or may not use, and they are not interchangeable.
+
+#: Anchor types that can legitimately be a schedule's origin, most specific
+#: first. An anchor outside this set (consent, screening, last dose, discharge,
+#: progression) measures something else and is never silently promoted to Day 0.
+ORIGIN_ANCHOR_TYPES: tuple[str, ...] = (
+    "randomization", "first_dose", "cycle_start", "period_start",
+)
+
+
+class BaselineResolution(BaseModel):
+    """Which anchor is Day 0, why, and what else it could have been.
+
+    ``status`` is the whole point of the type. RESOLVED carries an anchor;
+    UNRESOLVED carries the candidates a reviewer must choose between and no
+    anchor at all, so a caller physically cannot date a schedule off a guess.
+    """
+
+    status: Literal["RESOLVED", "UNRESOLVED", "ABSENT"]
+    anchor_id: str | None = None
+    anchor_type: str | None = None
+    anchor_name: str = ""
+    source_label: str = ""
+    evidence_ids: list[str] = Field(default_factory=list)
+    #: How the choice was made, in reviewer-readable terms.
+    reason: str = ""
+    #: Every anchor a reviewer would have to choose between. Populated whenever
+    #: the decision was not unambiguous, so the UI can show real alternatives.
+    alternatives: list[dict] = Field(default_factory=list)
+    #: True only when the schedule states its origin unambiguously.
+    requires_review: bool = False
+
+
+#: A study day printed on an anchor, e.g. "Day 0 of each period" -> 0. Used only
+#: to RANK candidate origins against each other; dates are still computed by the
+#: existing day-label machinery, which needs the protocol's Day 0/Day 1
+#: convention before it will convert anything.
+_ANCHOR_DAY_LABEL = re.compile(r"\bday\s*(-?\d+)\b", re.IGNORECASE)
+
+
+def printed_study_day(source_label: str | None) -> int | None:
+    """The study day the protocol printed on an anchor, or None if it printed none."""
+    match = _ANCHOR_DAY_LABEL.search(str(source_label or ""))
+    return int(match.group(1)) if match else None
+
+
+class _AnchorView(BaseModel):
+    """The little an origin decision needs, from a model or a raw payload alike.
+
+    The adapter holds a plan as the dict it was stored as, the projection holds a
+    validated model. Both must reach the SAME decision, so both are normalised
+    here instead of each growing its own copy of the rule.
+    """
+
+    id: str = ""
+    name: str = ""
+    anchor_type: str = "other"
+    source_label: str = ""
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
+def _plan_view(plan) -> tuple[list[_AnchorView], list[str]]:
+    """(anchors, anchor id referenced by each event in document order)."""
+    if isinstance(plan, CanonicalSchedulePlan):
+        anchors = [
+            _AnchorView(
+                id=item.id, name=item.name, anchor_type=item.anchor_type,
+                source_label=item.source_label, evidence_ids=list(item.evidence_ids))
+            for item in plan.anchors
+        ]
+        referenced = [str((event.timing.anchor_id or "")).strip() for event in plan.events]
+        return anchors, referenced
+
+    raw = plan if isinstance(plan, dict) else {}
+    anchors = []
+    for item in raw.get("anchors") or []:
+        if not isinstance(item, dict):
+            continue
+        anchors.append(_AnchorView(
+            id=str(item.get("id") or ""), name=str(item.get("name") or ""),
+            anchor_type=str(item.get("anchor_type") or "other"),
+            source_label=str(item.get("source_label") or ""),
+            evidence_ids=[str(x) for x in (item.get("evidence_ids") or [])],
+        ))
+    referenced = []
+    for event in raw.get("events") or []:
+        timing = event.get("timing") if isinstance(event, dict) else None
+        referenced.append(
+            str((timing or {}).get("anchor_id") or "").strip()
+            if isinstance(timing, dict) else "")
+    return anchors, referenced
+
+
+def _anchor_summary(anchor: _AnchorView) -> dict:
+    return {
+        "id": anchor.id, "name": anchor.name, "anchor_type": anchor.anchor_type,
+        "source_label": anchor.source_label,
+        "evidence_ids": list(anchor.evidence_ids),
+    }
+
+
+def anchor_usage_counts(plan) -> dict[str, int]:
+    """How many events actually count their timing from each anchor."""
+    anchors, referenced = _plan_view(plan)
+    counts: dict[str, int] = {anchor.id: 0 for anchor in anchors}
+    for anchor_id in referenced:
+        if anchor_id in counts:
+            counts[anchor_id] += 1
+    return counts
+
+
+def select_baseline_anchor(plan) -> BaselineResolution:
+    """Resolve one schedule origin for a canonical plan, or refuse to.
+
+    The single source of truth for Day 0. Every caller that needs to know where
+    a schedule starts - the flat projection, the UCTSM adapter, patient
+    enrolment - calls this and nothing else, which is what makes
+    "legacy Day 0 == canonical Day 0" true by construction rather than by
+    coincidence.
+    """
+    anchors, referenced = _plan_view(plan)
+    if not anchors:
+        return BaselineResolution(
+            status="ABSENT",
+            reason="The plan declares no anchors, so the schedule states no origin.",
+        )
+
+    def resolved(anchor: _AnchorView, reason: str) -> BaselineResolution:
+        return BaselineResolution(
+            status="RESOLVED", anchor_id=anchor.id, anchor_type=anchor.anchor_type,
+            anchor_name=anchor.name, source_label=anchor.source_label,
+            evidence_ids=list(anchor.evidence_ids), reason=reason,
+        )
+
+    def unresolved(candidates: list[_AnchorView], reason: str) -> BaselineResolution:
+        return BaselineResolution(
+            status="UNRESOLVED", reason=reason, requires_review=True,
+            alternatives=[_anchor_summary(item) for item in candidates],
+        )
+
+    candidates = [item for item in anchors if item.anchor_type in ORIGIN_ANCHOR_TYPES]
+
+    if not candidates:
+        # No anchor is typed as an origin. A single anchor leaves nothing to
+        # choose between; several mean a real choice nobody has made.
+        if len(anchors) == 1:
+            return resolved(
+                anchors[0],
+                f"The schedule declares a single anchor, typed "
+                f"{anchors[0].anchor_type!r}; there is no other candidate origin.")
+        return unresolved(
+            anchors,
+            "No anchor is typed as a schedule origin (randomisation, first dose, "
+            "cycle start or period start), and more than one anchor exists. The "
+            "schedule origin must be confirmed before any date is calculated.")
+
+    if len(candidates) == 1:
+        return resolved(
+            candidates[0],
+            f"The only anchor typed as a schedule origin "
+            f"({candidates[0].anchor_type!r}).")
+
+    # Several origin-typed anchors: rank them on what the document itself says,
+    # in decreasing order of authority.
+    #
+    #   1. the study day the protocol PRINTS on the anchor. An origin is the
+    #      lowest-numbered study day by definition, and this module already
+    #      treats printed day text as ground truth over any computed offset.
+    #   2. the position of the first event that counts from the anchor - the
+    #      schedule's own column order, not an assumption about the design.
+    #   3. anchor-type precedence, which only breaks a tie the document left.
+    #
+    # Anything the document does not state sorts last rather than being guessed.
+    first_reference: dict[str, int] = {}
+    for position, anchor_id in enumerate(referenced):
+        if anchor_id and anchor_id not in first_reference:
+            first_reference[anchor_id] = position
+
+    def rank(anchor: _AnchorView) -> tuple[float, float, int]:
+        printed = printed_study_day(anchor.source_label)
+        return (
+            float(printed) if printed is not None else math.inf,
+            float(first_reference.get(anchor.id, math.inf)),
+            ORIGIN_ANCHOR_TYPES.index(anchor.anchor_type),
+        )
+
+    best_key = min(rank(item) for item in candidates)
+    leaders = [item for item in candidates if rank(item) == best_key]
+    if len(leaders) == 1:
+        winner = leaders[0]
+        printed = printed_study_day(winner.source_label)
+        detail = (
+            f"the protocol prints it at study day {printed}"
+            if printed is not None
+            else (
+                "it is the first anchor the schedule's own events count from"
+                if winner.id in first_reference
+                else f"it has the most specific origin type ({winner.anchor_type!r})"
+            )
+        )
+        return resolved(
+            winner,
+            f"Chosen from {len(candidates)} origin-typed anchors because {detail}.")
+
+    return unresolved(
+        leaders,
+        f"{len(leaders)} anchors are equally plausible schedule origins - the "
+        "protocol prints no distinguishing study day, and its visits do not "
+        "count from one of them in preference to the others. A reviewer must "
+        "choose the schedule origin.")
 
 
 def _stable_id(prefix: str, label: str, index: int) -> str:
@@ -750,9 +1057,25 @@ def _calendar_elapsed_days(amount: TemporalAmount | None) -> float | None:
 # it when they disagree instead of trusting whatever arithmetic the model did in its
 # head. A schedule's own printed day numbers are ground truth; a computed offset is not.
 
-_SIMPLE_DAY_LABEL = re.compile(r"^\s*day\s*([+-]?\d+)\s*$", re.IGNORECASE)
+# A protocol frequently prints a visit's window in the SAME cell/phrase as its
+# day number - "Day 5 +/- 3 days", "Day 5 (+/-3d)" - and the model is not
+# always told to split that back out of source_day_label even though a
+# separate window_days field exists for it. Without tolerating this suffix
+# here, a label like that fails the "exact Day N" shape check below, the
+# deterministic offset cross-check silently never runs for that one visit,
+# and whatever offset the model computed on its own - potentially wrong -
+# passes through unvalidated. The suffix is matched and discarded, never
+# used for anything (window_days remains the only source of truth for the
+# window itself); this only widens what counts as an "exact Day N" label so
+# the existing correction can still fire.
+_DAY_LABEL_WINDOW_SUFFIX = (
+    r"(?:\s*[\(\[]?\s*(?:\+/-|\+-|±)\s*\d+(?:\.\d+)?\s*(?:d|days?)?\s*[\)\]]?)?"
+)
+_SIMPLE_DAY_LABEL = re.compile(
+    r"^\s*day\s*([+-]?\d+)" + _DAY_LABEL_WINDOW_SUFFIX + r"\s*$", re.IGNORECASE)
 _SIMPLE_DAY_RANGE_LABEL = re.compile(
-    r"^\s*days?\s*([+-]?\d+)\s*(?:-|–|—|to)\s*(?:day\s*)?([+-]?\d+)\s*$",
+    r"^\s*days?\s*([+-]?\d+)\s*(?:-|–|—|to)\s*(?:day\s*)?([+-]?\d+)"
+    + _DAY_LABEL_WINDOW_SUFFIX + r"\s*$",
     re.IGNORECASE,
 )
 # A short list/enumeration of specific days for one activity — "Day 12, 13 and 14",
@@ -872,7 +1195,7 @@ def simple_day_label_range_offsets(
 def project_canonical_plan(
     plan: CanonicalSchedulePlan,
     *,
-    open_ended_preview_count: int = 12,
+    open_ended_preview_count: int = 4,
     anchor_study_day: int | None = None,
     includes_day_zero: bool | None = None,
 ) -> tuple[list[dict], list[str]]:
@@ -895,10 +1218,20 @@ def project_canonical_plan(
     event_by_id = {item.id: item for item in plan.events}
     activity_by_id = {item.id: item for item in plan.activities}
     branch_by_id = {item.id: item for item in plan.branches}
-    preferred = next((item for item in plan.anchors if item.anchor_type in (
-        "randomization", "first_dose", "cycle_start", "period_start")), None)
-    baseline_anchor_id = preferred.id if preferred else (
-        plan.anchors[0].id if plan.anchors else None)
+    # Doc s4: one shared resolver, so this projection and the UCTSM adapter can
+    # never disagree about which anchor is Day 0. An unresolved origin leaves
+    # every offset undated and says so, rather than counting from a guess.
+    baseline = select_baseline_anchor(plan)
+    baseline_anchor_id = baseline.anchor_id
+    if baseline.status == "UNRESOLVED":
+        warnings.append(
+            "Schedule origin (Day 0) could not be determined: "
+            f"{baseline.reason} Candidates: "
+            + ", ".join(
+                f"{item['name']} ({item['anchor_type']})"
+                for item in baseline.alternatives)
+            + ". Visit dates cannot be calculated until a reviewer confirms the origin."
+        )
     anchor_by_id = {item.id: item for item in plan.anchors}
     conditions_by_target: dict[str, list[ScheduleCondition]] = {}
     for condition in plan.conditions:
@@ -1377,10 +1710,27 @@ def project_canonical_plan(
         # 21 days after") is a permitted boundary that the legacy row can only
         # show as one number, so it must never pass as a confirmed appointment.
         bounded_single_day = bool(inexact_note) and timing.kind != "range"
+        # A recurrence whose cadence is itself a stated range ("every 3-4
+        # months") is captured on the RecurrenceRule, not on any one occurrence
+        # — without this, the row for e.g. "Bone Marrow Aspirate (Occurrence 2)"
+        # looks like a confirmed single date with no indication the protocol
+        # actually allows a window of dates for every repeat.
+        range_cadence_note = None
+        if recurrence is not None and recurrence.frequency.value_max is not None:
+            unit = recurrence.frequency.unit
+            unit_label = unit if unit.endswith("s") else f"{unit}s"
+            low, high = recurrence.frequency.value, recurrence.frequency.value_max
+            range_cadence_note = (
+                f"Protocol states this recurs every {low:g}-{high:g} {unit_label} "
+                f"('{recurrence.source_label}'), not a fixed interval — this "
+                "occurrence's date is one illustrative point within that range."
+            )
+            operational_constraints.append(range_cadence_note)
         review = (
             unresolved
             or bounded_single_day
             or event.window.state in ("unclear", "conflicting")
+            or range_cadence_note is not None
         )
         return {
             # Keep the canonical template ID stable for API/backward compatibility;
@@ -1446,7 +1796,9 @@ def project_canonical_plan(
                 end = recurrence.start_occurrence + max(1, open_ended_preview_count) - 1
                 warnings.append(
                     f"'{recurrence.source_label or recurrence.id}' is open-ended; "
-                    f"showing {open_ended_preview_count} occurrences for review only.")
+                    f"showing the first {open_ended_preview_count} occurrences for review "
+                    f"only. This preview is not the schedule limit - the protocol rule "
+                    f"continues until its stopping criteria are met.")
             frequency_days = _elapsed_days(recurrence.frequency)
             group_events = [e for e in plan.events if e.id in recurrence.event_ids]
             for occurrence in range(recurrence.start_occurrence, end + 1):

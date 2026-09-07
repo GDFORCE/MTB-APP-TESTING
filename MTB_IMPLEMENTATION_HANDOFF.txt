@@ -1,0 +1,1237 @@
+MTB UNIVERSAL SCHEDULE IMPLEMENTATION HANDOFF
+=============================================
+
+Last updated: 4 September 2026 (session 9)
+Repository:   D:\MTB_Intern_work_folder\APP-New-approch\MTB-APP
+Branch:       universal-schedule-engine
+
+HOW TO READ THIS FILE
+---------------------
+  A. Architecture boundary  - read first, two parallel systems still exist
+  B. DONE                   - every claim is backed by a named passing test
+  C. PARTIAL                - what exists and what is still missing
+  D. NOT STARTED            - priority ordered, with why it is blocked
+  E. Verification commands and honest test baseline
+  F. Worktree ownership / do-not-overwrite
+  G. Per-requirement coverage audit - what is NOT done, per requirement doc
+  H. Completion estimate by layer and by requirement document
+
+Section B is the source of truth. If a capability is not listed there with a test,
+assume it is not done, whatever any other document says.
+
+
+A. ARCHITECTURE BOUNDARY
+========================
+Two scheduling systems live in this repo. This is deliberate and NOT yet resolved.
+
+1. LIVE PRODUCT (serves real users today)
+   backend/server.py  +  Mongo collections `visits` / `visit_instances`
+   Active Expo routes under frontend/app/(app)/...
+   Handles simple baseline-relative schedules only.
+
+2. CANONICAL ENGINE (UCTSM - Universal Clinical Trial Schedule Model)
+   backend/app/domain/schedule/   models, timing, condition, conditional,
+                                  evaluator, validator, projection
+   backend/app/services/          schedule, impact, extraction,
+                                  schedule_projection, notification
+   backend/app/db/                SQLAlchemy / Postgres
+   backend/app/api/uctsm.py       HTTP surface
+   frontend/src/features/uctsm/   shared tabular UI
+
+All new requirement work lands in the UCTSM engine. It is NOT yet wired to the live
+patient workflow. Convergence plan: UCTSM owns meaning / version / evaluation;
+Mongo remains a compatibility operational projection until the bridge and parity
+gates in D-1 are complete.
+
+SESSION 9 CHANGED THIS BOUNDARY for NEWLY CREATED trials only. Add Trial now
+builds canonical DRAFT schedule versions from the same extraction it already ran,
+and routes the sponsor to the UCTSM protocol review screen. Add Patient reads the
+approved canonical schedule for its protocol-group fields. The operational Mongo
+path is untouched and still serves every existing trial and every visit WRITE.
+
+Still true: DO NOT switch an existing trial's visit READS to UCTSM until D-1
+passes parity for that trial. Building a draft is not a cutover - a draft cannot
+reach a patient until a person approves it.
+
+
+B. DONE - VERIFIED WITH TESTS
+=============================
+
+B1. No current-date fallback for a clinical anchor  [doc 1 s14]
+    server.py::_patient_visit_anchor never falls back to now(). It accepts an
+    explicit ISO date/datetime, normalizes to UTC, prefers baseline_date, and keeps
+    enrolled_date only as an explicit legacy anchor. A missing or invalid anchor
+    produces NO scheduled or window dates plus manual_review - never a plausible
+    looking date. Applied to /visits/mine, initial materialization, late-added
+    templates, and future-template rematerialization.
+    TEST: backend/tests/test_patient_visit_anchor_safety.py
+
+B2. Canonical clinical vocabulary (additive, backward compatible)
+    app/domain/schedule/models.py defines DependencyMode, QualifierScope,
+    QualifierCategory, Qualifier, ConditionalAction, ConditionalDefinition,
+    RepeatBlock, ConfinementEpisodeDefinition, ConfinementDayDefinition,
+    GenericDimension, ConditionState, BlockState, ConfinementStatus,
+    PatientActivityStatus, PatientConditionStatus.
+    All additions are optional/defaulted, so existing payloads stay valid.
+    TEST: backend/tests/test_uctsm_schedule_semantics.py
+
+B3. Blocking semantic validation  [docs 2, 4, 6, 7]
+    app/domain/schedule/validator.py blocks approval on:
+      - dependency with missing or UNCLEAR dependency mode
+      - repeating block with UNCLEAR dependency mode
+      - unknown applicability values (event and activity level)
+      - conditional action targeting an unknown event / block / episode
+      - repeat-until action with no interval, or with no resolution rule
+      - confinement extension with no duration
+      - conditional definition with no source evidence, or still UNRESOLVED
+      - confinement referencing unknown events or activities
+      - confinement conflating admission / dose / discharge
+      - duplicate study-day numbers, or a Day 0
+      - orphan, unresolved, or evidence-free qualifiers
+      - events / activities / episodes without claim-level protocol evidence
+      - duplicate activity codes in one visit
+      - activity timing referencing an unknown activity, or itself
+    TESTS: test_uctsm_schedule_semantics.py, test_uctsm_activity_timing.py,
+           test_uctsm_confinement.py
+
+B4. Relational persistence + migrations
+    Migrations 0001 base, 0002 semantics, 0003 patient impact, 0004 conditional /
+    repeat / dimension / confinement, 0005 patient activities, 0006 patient
+    conditions, 0007 condition-derived anchor source.
+    Every migration is inspector-guarded, so it is safe on an existing schema and
+    on a fresh create_all database. Verified by running the chain to head.
+    TEST: backend/tests/test_uctsm_persistence.py
+
+B5. Patient schedule-version pinning + amendment workflow  [doc 9]
+    app/services/impact_service.py implements preview -> confirm -> reconcile:
+      - patient pinned to an immutable approved schedule version
+      - preview returns UNCHANGED / ADDED / MOVED / STATUS_CHANGED / CANCELLED /
+        PROTECTED and writes nothing
+      - proposals carry an expiry AND a SHA-256 input fingerprint; confirmation is
+        rejected as STALE if patient inputs or the assignment moved underneath it
+      - confirmation writes PatientScheduleAssignment + audit events
+      - existing patients are never auto-migrated when a new version is approved
+    TEST: backend/tests/test_uctsm_impact.py
+
+B6. Deterministic reconciliation with protected history  [doc 1 s18-20]
+    Stable logical_occurrence_id / logical_key across re-evaluations, so re-running
+    recalculates one visit instead of creating duplicates. COMPLETED / MISSED /
+    actual-dated occurrences are PROTECTED: dates and statuses carry forward
+    untouched while the expected date is still recalculated for deviation analysis.
+    idempotency_key prevents duplicate generation runs. Every evaluation is audited.
+    TESTS: test_uctsm_impact.py, test_uctsm_workflow.py
+
+B7. Dependency modes  [doc 4]
+    NOMINAL: later visits stay on the original timeline when an earlier visit runs
+    late. ACTUAL_PREVIOUS_EVENT: dependents recalc from the ACTUAL previous date and
+    stay BLOCKED with waiting_for_actual until that actual exists. MANUAL: stays
+    WAITING_FOR_ANCHOR until a site-entered date arrives. UNCLEAR: blocked at
+    validation, never guessed.
+    TEST: backend/tests/test_uctsm_domain.py
+
+B8. Recurrence / open-ended schedules in the canonical engine  [doc 3]
+    Recurrence is stored as a RULE and expanded only to an explicit horizon.
+    Termination supports COUNT / DATE / EVENT / CONDITION / HORIZON. A termination
+    condition that is TRUE but has no effective time returns UNRESOLVED rather than
+    a guessed stop date.
+    TEST: backend/tests/test_uctsm_domain.py
+
+B9. Activity-level / intra-day timing  [doc 5 s35-47]            <-- session 3
+    - New ActivityReference temporal reference: an activity may be timed from
+      another activity in the same visit occurrence (dose, infusion end, previous
+      sample, arrival).
+    - evaluator.evaluate_activities resolves each occurrence's activities:
+      applicability, conditions, requiredness, sequence order, planned time,
+      activity window, actual time.
+    - SAFETY: an activity anchored on another activity resolves ONLY from that
+      activity's ACTUAL recorded time. Patient arrival is never a default anchor.
+      Unresolved activities return WAITING_FOR_ANCHOR naming what they wait on
+      (explanation.waiting_for_activity).
+    - Progressive generation: arrival-anchored work resolves once arrival is
+      recorded; dose-anchored work waits for the dose time.
+    - Correcting a dose time moves pending activities but leaves recorded actual
+      times untouched; the expected time is still recalculated for deviation.
+    - Recurring visits keep intra-day actuals separated per occurrence index.
+    - Persistence: uctsm_patient_activities (materialized day-wise schedule) and
+      uctsm_patient_activity_records (append-only; corrections supersede).
+    - API: POST /patients/{id}/activities; GET /patients/{id}/schedule returns
+      each event's activities.
+    TESTS: test_uctsm_activity_timing.py (10), test_uctsm_condition_workflow.py
+
+B10. Conditional / triggered scheduling engine  [doc 2]           <-- session 3
+    - app/domain/schedule/conditional.py builds a ConditionalPlan per patient:
+      which events are activated, cancelled, or held for manual review, and which
+      repeating blocks are paused or stopped. It decides WHAT applies; the
+      evaluator decides WHEN.
+    - An untriggered conditional visit gets NO date, so it can never become due,
+      overdue, or generate a reminder.
+    - PENDING_CONFIRMATION does not act: a detected but unconfirmed condition never
+      restructures the schedule.
+    - REPEAT_EVENT generates repeat-until-resolution occurrences from the condition
+      occurrence date and stops at the recorded resolution date.
+    - STOP_BLOCK cancels only future occurrences of a repeating block; completed
+      cycles are preserved. PAUSE_BLOCK marks future occurrences PAUSED, not
+      cancelled. A stop is terminal - a later pause or resume cannot revive it.
+    - A condition occurrence date can anchor resulting visits (Anchor gains
+      source_condition_code), so "survival follow-up 12 weeks after progression"
+      resolves from the confirmed progression date.
+    - Conditional definitions carry their own applicability, so an arm-restricted
+      rule is not even offered to patients in another arm.
+    - MANUAL_REVIEW keeps the event UNRESOLVED with a named reason and no date.
+    - Activation is patient-specific: one patient progressing never touches another.
+    TEST: backend/tests/test_uctsm_conditional_engine.py (12)
+
+B11. Condition activation as a confirmed, auditable workflow  [doc 2 s10, s34-36]
+    Doc 2 is explicit that selecting a condition must not immediately restructure
+    the schedule. Condition changes reuse the impact preview -> confirm pipeline:
+      - preview evaluates with the proposed condition WITHOUT persisting it, and
+        the proposed change is part of the staleness fingerprint
+      - confirm persists the transition, then re-evaluates and reconciles
+      - reversal writes a CANCELLED row that supersedes the activation rather than
+        deleting it, and the wrongly activated pathway returns to inactive
+      - every transition writes PATIENT_CONDITION_STATE_CHANGED to the audit log
+    API: GET  /patients/{id}/conditions
+         POST /patients/{id}/conditions/impact-preview
+         POST /schedule-impact-proposals/{id}/confirm | /cancel
+    TEST: backend/tests/test_uctsm_condition_workflow.py (6)
+
+B12. Confinement / inpatient episodes  [doc 6]                    <-- session 3
+    - A continuous stay is ONE parent episode with child study days, never one
+      hospital visit per study day.
+    - Study-day dates use clinical day numbering (there is no Day 0), so Day -1 is
+      one day before Day 1.
+    - Admission, dose, and discharge stay distinct events, so the dosing anchor is
+      never replaced by the admission time.
+    - Actual admission puts the patient IN_CONFINEMENT; the episode stays open until
+      an ACTUAL discharge is recorded. A planned discharge date passing does not
+      close it.
+    - Planned and actual admission/discharge are kept separate for deviation.
+    - A conditional EXTEND_CONFINEMENT moves the expected discharge and marks the
+      episode EXTENDED; it never creates a second episode.
+    - Episodes respect arm/cohort applicability.
+    TEST: backend/tests/test_uctsm_confinement.py (12)
+
+B13. Reminder and calendar projection  [docs 1 s24-25, 2 s37-38, 6 s40-41, 10 s21-23]
+    app/services/schedule_projection.py:
+      - only RESOLVED, dated occurrences produce reminders; awaiting-anchor,
+        inactive-conditional, paused, cancelled, and unscheduled items are reported
+        under `suppressed` WITH A REASON rather than silently dropped
+      - wording follows the event type: a phone follow-up never tells a patient to
+        travel, and requires_attendance is false for it
+      - policy state UPCOMING / DUE_WINDOW / OVERDUE uses the protocol window
+      - a confinement is ONE multi-day calendar entry and absorbs its internal study
+        days, so an admitted patient gets no further "come to hospital" reminders
+      - reconcile() is idempotent: unchanged input produces no churn, a moved visit
+        cancels the old reminder and adds the new one rather than leaving both
+    API: GET /patients/{id}/schedule/projection
+    TEST: backend/tests/test_uctsm_projection.py (8)
+
+B14. Open-ended preview separated from the protocol definition  [doc 3 s36]
+    protocol_extraction.py: OPEN_ENDED_CYCLE_CAP is renamed
+    OPEN_ENDED_PREVIEW_CYCLES (old name kept as an alias for callers) and documented
+    as a display/performance preview limit, not a schedule limit. When an
+    open-ended block is expanded, the reviewer assumption now states explicitly that
+    the rows are a PREVIEW, that the last shown cycle is NOT the last cycle, and
+    that the schedule continues per protocol. A protocol-stated maximum is still
+    honoured as a real limit. The canonical projection warning says the same.
+    NOTE: the live Mongo path still materializes those preview cycles as visits.
+    Replacing that with a rolling horizon depends on D-1. See D-3.
+    TESTS: test_protocol_expansion.py, test_schedule_schema_v2.py
+
+B15. Tabular UI conformance  [UI specification]                   <-- session 3
+    frontend/src/features/uctsm/presentation.ts + ScheduleTable.tsx:
+      master columns  Visit | Type | Timing | Window | Key Activities | Applies To | Status | Notes
+      patient columns Visit | Type | Planned Date | Window | Actual Date | Key Activities | Status | Notes
+      - status vocabulary matches UI spec section 6 (Awaiting Anchor, Inactive,
+        Paused, Cancelled, Unresolved, Completed, Due, Upcoming)
+      - an undated anchor-dependent row reads "Awaiting Last Dose Date" instead of
+        showing a blank cell or an invented date
+      - qualifiers render as a short indicator ("Footnote a"); the source text,
+        scope in clinical language, and category appear on expansion. An unresolved
+        qualifier reads "needs review"
+      - conditional requirements render in their OWN compact table
+        (ConditionalRequirementsTable) with a "Condition occurred" action, never as
+        dated rows in the schedule
+      - expanding a visit shows the day-wise activity child table with planned time,
+        actual time, and what an activity is waiting for
+      - raw enums (scope, dependency mode, action types) are translated to clinical
+        language and never surface in the main table (UI spec section 7)
+      - mobile cards are a responsive rendering of the same rows, not a second model
+    TESTS: frontend/tests/uctsm-tabular-ui.test.ts (10),
+           frontend/tests/uctsm-presentation.test.ts (3)
+
+B16. Protocol deviation detection and reporting               <-- session 4
+    [doc 1 s18 and s26, doc 2 s39, doc 3 s31, doc 4 s25, doc 5 s17, doc 6 s38,
+     doc 9 s27]
+    app/domain/schedule/deviation.py + app/services/deviation_service.py.
+    Deviation is COMPUTED, never stored: the protocol-expected date is recalculated
+    whenever an anchor is corrected, so a stored deviation would go stale.
+      - two magnitudes, because the requirement uses both: delta_from_planned
+        (doc 1 s18 "early by 2 days", reported even inside the window) and
+        outside_window (doc 1 s26 "1 day late", measured from the window edge)
+      - a visit is only assessable if it was an ACTIVE dated requirement. An
+        untriggered conditional, an awaiting-anchor visit, a paused or cancelled
+        occurrence all come back NOT_ASSESSABLE with the reason, never as overdue
+      - MISSED only once the window has fully elapsed
+      - doc 4 s25 honoured: a visit that legitimately moved because an earlier one
+        ran late is compared against its CURRENT expected date, not the original
+        provisional one
+      - activity-level timing deviation in minutes (doc 5 s17)
+      - confinement admission/discharge deviation, with a confirmed extension
+        reported separately from an unexplained late discharge (doc 6 s38)
+      - windows come from the patient's pinned version (doc 9 s27)
+    API: GET /patients/{id}/deviations
+    TESTS: test_uctsm_deviation.py (20), test_uctsm_deviation_service.py (5)
+
+B17. PI/CRC dashboard                                         <-- session 4
+    [doc 2 s13, doc 3 s28, doc 5 s25, doc 10 s24]
+    app/services/dashboard_service.py returns ACTIONS, not a schedule.
+    The negative requirements are the tested ones:
+      - an open-ended protocol generating 30+ cycles puts at most a few near-term
+        visits on the board, never the whole series (doc 3 s28)
+      - a conditional the patient never triggered is absent entirely (doc 2 s13)
+      - a completed visit drops off
+      - an expired impact proposal drops off
+    Categories, priority ordered: impact confirmation, anchor confirmation,
+    condition confirmation, overdue visit, deviation, due visit, incomplete
+    activity, active condition. Wording is clinical - "telephone", not
+    PHONE_CONTACT (doc 2 s46).
+    API: GET /dashboard/actions
+    TEST: test_uctsm_dashboard.py (10)
+
+B18. Deterministic footnote completeness check                <-- session 4
+    [doc 7 s22 to s27]
+    app/extraction/completeness.py implements the third of doc 7's three roles:
+    "the LLM determines WHAT THE FOOTNOTE MEANS, the resolution layer determines
+    WHAT IT APPLIES TO, deterministic validation ensures NOTHING IS SILENTLY LOST."
+      - scans page text for markers: superscript letters and digits, symbols
+        (* dagger double-dagger section pilcrow hash), and attached cell markers
+        such as Xa / X* / X1, folding superscripts to their plain form
+      - detects footnote definition lines, without mistaking a numbered visit row
+        for a footnote
+      - blocks approval when a detected marker never became a qualifier (s23),
+        when a footnote has no marker (s25), or a marker has no definition (s26)
+      - raises CONFLICTING_SOURCE when two qualifiers in the same category say
+        different things about one target, rather than choosing one (s27)
+    Wired into the extraction graph's FINAL_VALIDATION node, so it runs on every
+    extraction.
+    TEST: test_uctsm_footnote_completeness.py (14)
+
+B19. Confinement integrity rules                              <-- session 4
+    [doc 6 s26 rules 1 to 3]
+    These need patient dates, not structure, so they live in the evaluator:
+      - rule 1: a discharge before its admission (planned or actual) puts the
+        episode into WAITING_FOR_ANCHOR with a named reason instead of producing an
+        impossible stay
+      - rules 2 and 3: two episodes whose date spans overlap are both flagged, since
+        a patient cannot be admitted to two stays at once. Sequential periods with a
+        washout between them are correctly NOT flagged.
+    TEST: test_uctsm_confinement.py (16)
+
+B20. Rolling horizon for open-ended repeats                   <-- session 5
+    [doc 3 s2, s4, s7, s8, s36]
+    RollingHorizon in app/domain/schedule/models.py, applied by
+    _apply_rolling_horizon in evaluator.py.
+    The two halves of this requirement pull against each other, so both are
+    tested:
+      - a q21d protocol with no stated end must not put fifty visits on a
+        patient, so only a few upcoming occurrences are materialized
+      - the number we chose to write down must NEVER read as the protocol
+        maximum. Every rule with more to come emits a RepeatSummary carrying the
+        cadence and how it really ends ("no stated maximum"), so a UI says
+        "continues" instead of showing the last row as the end
+    Past occurrences are exempt from the cap: the bound is on the FUTURE, and
+    completed cycles are protected history. Dependent events are computed from
+    the full series and only the output is trimmed, so capping cannot move a
+    date. A real protocol maximum (COUNT) ends the series with no summary at all.
+    Passing no policy keeps the previous behaviour, so existing callers are
+    unaffected.
+    API: POST /patients/{id}/schedule/evaluate accepts upcoming_limit / as_of;
+         GET /patients/{id}/schedule returns repeat_rules.
+    UI: toRepeatRuleRows + RepeatRuleFooter.
+    TESTS: test_uctsm_rolling_horizon.py (6 of 11), uctsm-event-types.test.ts (2)
+
+B21. Pause and resume semantics for a repeating block         <-- session 5
+    [doc 3 s19, s20]
+    BlockDirective now keeps the ORDERED transition history, not just the latest
+    state, because a block that paused and resumed needs the pause interval.
+      - occurrences inside the pause are PAUSED, not missed
+      - NOMINAL resume: the cadence keeps its original grid; occurrences during
+        the hold are simply not made up
+      - ACTUAL_RESUME: the cadence restarts from the resume date, shifting later
+        occurrences by exactly the days held
+      - MANUAL or UNCLEAR: the protocol did not say, so nothing is invented. The
+        occurrences after the resume go UNRESOLVED with the reason, for a reviewer
+      - a stop stays terminal; a later pause or resume cannot revive it
+    TESTS: test_uctsm_rolling_horizon.py (5 of 11)
+
+B22. Protocol-defined unscheduled visits                      <-- session 5
+    [doc 10 s13, s14, s15]
+    Event.activation = ON_DEMAND, evaluated by _evaluate_on_demand.
+    "Unscheduled Visit - may occur at any time for suspected toxicity" is a
+    DEFINITION. Treating it as a dated visit produces a reminder nobody
+    scheduled and an overdue flag for a visit that was never required, so:
+      - the definition evaluates to AVAILABLE_ON_DEMAND, a status distinct from
+        both NOT_APPLICABLE and WAITING_FOR_CONDITION, carrying no date
+      - deviation reports it as NOT_ASSESSABLE ("never required to occur"),
+        never as missed; the projection emits no reminder for it
+      - the validator no longer blocks approval on its undated timing, because
+        having no computable date IS the requirement here. The inverse mistake -
+        an on-demand visit that also has a calculated protocol date - is now
+        blocked as CONFLICTING_SOURCE
+      - creating one is patient data: it produces a dated occurrence carrying the
+        definition's activities, and reaches no other patient and no master
+        schedule. Regeneration reproduces it rather than erasing it
+      - a reason is mandatory, and a scheduled protocol visit cannot be created
+        this way, so a CRC cannot invent a protocol requirement
+    API: POST /patients/{id}/unscheduled-visits
+    DB: migration 20260901_0010, table uctsm_patient_unscheduled_visits
+    TESTS: test_uctsm_event_types.py (7 of 15), test_uctsm_unscheduled_api.py (6)
+
+B23. Visit mode vocabulary                                    <-- session 5
+    [doc 10 s2, s3, s18, s21-s23, s31-s33]
+    Event.visit_mode and Event.allowed_visit_modes, carried onto EvaluatedEvent
+    and persisted on the patient event.
+      - a hybrid visit ("clinic or telephone") preserves BOTH modes and selects
+        neither; the validator surfaces it for per-patient selection as a
+        WARNING, since the protocol itself is legitimate
+      - a stated mode outside the permitted set is blocking CONFLICTING_SOURCE
+      - an unstated mode stays unstated. displayVisitMode renders "Not stated in
+        the protocol" rather than defaulting to a clinic visit, because the
+        default is what sends a patient travelling on a guess
+      - the mode recorded for an actual unscheduled visit overrides the
+        definition's, so a check the protocol expects in clinic can be recorded
+        as having been done by telephone
+      - extraction has an event_types node, separate from events, because mode
+        usually comes from surrounding prose rather than the schedule table
+    TESTS: test_uctsm_event_types.py (8 of 15), uctsm-event-types.test.ts (8)
+
+B24. Anchor status vocabulary                                 <-- session 5
+    [doc 1 s22]
+    app/domain/schedule/anchor_status.py (pure) +
+    app/services/anchor_status_service.py (reads the stored records).
+    NOT_REQUIRED / AWAITING_EVENT / PLANNED / ACTUAL / CONFIRMED / CORRECTED.
+    The pair that matters is PLANNED vs ACTUAL. A planned surgery date is not
+    evidence surgery happened, so:
+      - a PLANNED value never becomes ACTUAL on its own; only a record whose
+        source asserts the event occurred does that
+      - an unrecognised source type is treated as PLANNED, never as ACTUAL, so a
+        new source cannot quietly promote an expectation into a fact
+      - AWAITING_EVENT names the event it waits on, which is what makes an
+        undated visit explicable instead of broken
+      - an unconfirmed candidate is not the anchor's value at all (doc 1 s10, s16)
+      - CORRECTED is distinct from CONFIRMED, so a reviewer sees that a confirmed
+        date was changed rather than only seeing the new one
+      - NOT_REQUIRED is derived: an anchor only referenced by visits this patient
+        will not have stops sitting on a site's to-do list. If the patient context
+        cannot be built, every anchor is shown rather than hidden - a spurious
+        anchor is recoverable, a hidden one leaves a visit undated forever
+    API: GET /patients/{id}/anchors
+    UI: toAnchorStatusRows
+    TESTS: test_uctsm_anchor_status.py (12), test_uctsm_anchor_status_service.py (7),
+           uctsm-event-types.test.ts (3)
+
+B25. Nested protocol groups and dependent enrolment           <-- session 5
+    [doc 8 s10, s15-s18, s30]
+    StudyDimension.parent_dimension_type / parent_code, plus
+    app/domain/schedule/enrolment.py.
+      - "Part A, Cohort 1" is modelled, so enrolment offers only the cohorts
+        inside the part already chosen. Listing every cohort lets someone record
+        an assignment that does not exist, which then produces a schedule for a
+        patient nobody can find in the protocol
+      - a dimension whose values all nest inside an unchosen parent comes back
+        BLOCKED with the reason, rather than listing values that cannot apply
+      - a parent with no children says so instead of appearing broken
+      - validate_assignment checks the WHOLE resulting assignment: a cohort from
+        the wrong part is refused, and so is a nested cohort with no part
+      - doc 8 s30: an undefined value is refused, never dropped. Silently turning
+        an unknown group into "no group" widens who gets a restricted visit
+      - a half-stated hierarchy (parent type without parent code) is refused at
+        the model boundary, because it would behave as if there were none
+    API: GET /schedule-versions/{id}/enrolment-options
+    DB: migration 20260901_0011
+    UI: toEnrolmentFields
+    TESTS: test_uctsm_enrolment.py (15), uctsm-event-types.test.ts (3)
+
+B26. Patient reassignment through impact preview              <-- session 5
+    [doc 8 s22]
+    PatientScheduleImpactService.preview/confirm now accept assignment_change.
+    Reassigning an arm, cohort, part or substudy changes WHICH visits a patient
+    has, so it is exactly the kind of change the master requirement says must be
+    confirmed rather than applied:
+      - the preview evaluates against a DETACHED copy of the patient, so asking
+        the question cannot change the answer. A preview never confirmed leaves
+        the patient untouched
+      - confirming applies the assignment, regenerates, and audits with the
+        previous assignment recorded in `before`
+      - the patient's CURRENT assignment is part of the input fingerprint, so a
+        proposal confirmed after someone else moved that patient goes STALE
+        instead of applying numbers that were computed for a different state
+      - values are validated through the same hierarchy rules as enrolment
+      - open dimensions (PART / SEQUENCE / SUBSTUDY / COUNTRY) go through
+        dimension_values, so no migration is needed per protocol
+    API: POST /patients/{id}/assignment/impact-preview, confirmed by the existing
+         POST /schedule-impact-proposals/{id}/confirm
+    TESTS: test_uctsm_assignment_impact.py (6)
+
+B27. Typed schedule-version comparison                        <-- session 5
+    [doc 9 s10]
+    app/domain/schedule/diff.py gains ChangeType, Significance and TypedChange
+    alongside the existing raw field diff, which is unchanged for callers.
+    A raw diff says "these bytes differ". The question a reviewer is answering is
+    "does this amendment affect anyone already enrolled?", so every difference is
+    classified:
+      - visit added / removed / renamed, timing changed, window widened vs
+        NARROWED, activity added / removed / changed, applicability, trigger,
+        dependency, recurrence, visit mode, anchor added / removed
+      - WINDOW_WIDENED and WINDOW_NARROWED are separate types because they are
+        not equally safe: nothing already booked can fall outside a WIDER window,
+        while narrowing one can put existing bookings out of window
+      - a window change is only reported as such when the NOMINAL date did not
+        also move; moving the visit itself is a TIMING_CHANGED
+      - a rename is ADMINISTRATIVE. Everything else, including any change type
+        not on the list, is CLINICAL - an unclassified change is one nobody has
+        looked at
+      - activities are compared individually, not as one blob, and a regenerated
+        UUID is not treated as an amendment
+    API: GET /schedule-versions/{left}/diff/{right} now also returns
+         typed_changes and clinically_significant_count.
+    UI: toScheduleChangeRows, clinical changes sorted first.
+    TESTS: test_uctsm_schedule_diff.py (15), uctsm-event-types.test.ts (3)
+
+B28. LLM extraction provider                                  <-- session 6
+    [the D-2 blocker; doc 7 s2-s3 division of labour]
+    app/extraction/llm_client.py (transport), prompts.py (the rules the model is
+    held to), claude_provider.py (the provider), runner.py (execution).
+
+    THE DIVISION OF LABOUR IS THE DESIGN:
+        the MODEL reads the protocol and produces CLAIMS with citations;
+        deterministic code ASSEMBLES those claims into the canonical schedule.
+    Assembly is not a second model call. Source traceability has to survive the
+    pipeline, and a model asked to emit its own ClaimEvidence will occasionally
+    forget one - at which point a schedule looks complete while a reviewer can no
+    longer check where a rule came from. Generating traceability mechanically
+    from each claim's citations makes that failure impossible rather than rare.
+
+    One focused call per semantic category (18 of them) rather than one enormous
+    call, so a bad answer degrades ONE dimension of meaning instead of losing the
+    extraction. The document is sent as a cached prefix, so calls after the first
+    are cheap.
+
+    WHAT HAPPENS WHEN THE MODEL IS WRONG - the tested part:
+      - a claim citing a passage that does not exist is DROPPED with an issue.
+        The model only ever sees refs it was given ("e1"), never UUIDs, so it
+        cannot invent a citation that resolves
+      - a claim naming a visit that was never extracted raises UNRESOLVED_REFERENCE
+      - a timing the model expressed wrongly leaves the visit UNRESOLVED rather
+        than becoming a near-miss date nobody would question
+      - prose instead of JSON becomes an issue, never an empty answer - an empty
+        answer is indistinguishable from "the protocol does not say this"
+      - a visit with no timing claim gets UNRESOLVED plus an issue naming it, and
+        the validator blocks approval. That is the correct outcome
+      - an unreachable model produces issues and no events, not a plausible-looking
+        empty protocol
+    Unstated things stay unstated: no defaulted visit mode, no defaulted
+    dependency mode, no invented recurrence maximum.
+
+    Assembly runs in the CONSISTENCY_CHECK node, not the assembly node, because
+    the graph collects issues before it collects the schedule - assembling later
+    computed the reviewer-facing findings and then discarded them.
+
+    API: POST .../extract-schedule now executes in the background and reports
+         provider_configured. A run that cannot start is marked FAILED with the
+         reason instead of sitting QUEUED forever.
+    CONFIG: ANTHROPIC_API_KEY, UCTSM_EXTRACTION_MODEL (default claude-opus-5).
+    TESTS: test_uctsm_llm_extraction.py (24, all offline via a scripted client),
+           test_uctsm_unscheduled_api.py (1 API-level)
+
+B29. The app consumes the engine                              <-- session 6
+    [the D-4 blocker]
+    frontend/src/features/uctsm/api.ts gained every engine endpoint that had no
+    caller: anchor statuses, deviations, dashboard actions, unscheduled visits,
+    enrolment options, assignment preview, version diff, extraction runs.
+
+      - PatientScheduleScreen now shows the Reference Dates table (doc 1 s3/s22 -
+        an undated visit reads as "Awaiting Surgery Date", not as a broken row),
+        the continuing-repeat footer (doc 3 s4/s36), and computed deviations with
+        both magnitudes (doc 1 s18 and s26). Anchor status and deviations load
+        with Promise.allSettled: a failure in a derived view must not hide the
+        schedule itself, which is what the site actually needs
+      - NEW ActionBoardScreen at /(app)/clinical/action-board, linked from the PI
+        dashboard quick actions and the CRC tab bar. It is an ACTION board, not a
+        schedule: the engine already bounds it so an open-ended protocol cannot
+        flood it and an untriggered conditional is absent
+    TESTS: uctsm-event-types.test.ts (4 more, 40 total)
+
+B30. Model round-trip fix                                     <-- session 6
+    StrictModel gained populate_by_name. RecurrenceTermination.termination_date
+    carries alias "date", so it serialised under one name and was rejected under
+    the other: a recurrence ending on a fixed date could not survive being stored
+    and read back. Found because the extraction pipeline re-validates its own
+    output. Pre-existing; affected the repository round-trip too.
+
+B31. Condition recurrence and version effective date          <-- session 7
+    [doc 2 s14, doc 9 s8]
+    ConditionState.RECURRED. A toxicity that came back is not the same clinical
+    picture as one occurring for the first time, even though the protocol
+    response is identical. So it ACTS exactly like ACTIVE - the same visits are
+    generated, anchored on the recurrence's OWN date - but stays distinguishable
+    for a reviewer deciding on dose reduction. A RECURRED status at occurrence
+    index 0 is refused, because index 0 is the first occurrence.
+
+    ScheduleVersion.effective_from. Approval and effect are different moments. An
+    amendment approved today may not apply to new enrolments until a stated date:
+      - the approved-schedules listing reports effective_from and in_force
+      - ENROLMENT REFUSES a version that has not taken effect, naming the date it
+        starts. Silently enrolling onto a future amendment puts a patient on a
+        schedule the protocol says does not apply to them
+      - NULL keeps the previous behaviour, so every existing row is unchanged
+    DB: migration 20260901_0012
+    TESTS: test_uctsm_version_effect.py (10)
+
+B32. The review and reading surfaces                          <-- session 7
+    [UI spec s4.4, s4.5, s4.7, s4.10; doc 1 s27; doc 4 s7; doc 8 s33]
+    Seven surfaces whose APIs existed but which nothing rendered.
+
+    IMPACT PREVIEW TABLE (UI s4.5) - what a change would do, before it is
+    applied. Consequential rows sort FIRST and protected history is labelled
+    "Already happened - unchanged", because the question a reviewer is answering
+    is "is anything here wrong", and a list whose important row is twentieth gets
+    skimmed. The workbench previously previewed and confirmed in the same breath,
+    which demonstrates the opposite of what the requirement asks; it now records
+    each preview and shows it.
+
+    VERSION CONTEXT HEADER (UI s4.10, doc 9 s12-13) - which version produced
+    these dates. A patient on an older version is TOLD WHY, not warned: staying
+    pinned is correct behaviour, and without the note, two patients on one trial
+    showing different dates looks like a bug.
+
+    CONFINEMENT EXPANSION (UI s4.7, doc 6 s17/s31) - one stay, expandable to its
+    study days. A row per day would read as several separate visits, which is the
+    misreading the confinement model exists to prevent. The projection endpoint
+    now returns the day breakdown, not just the calendar span.
+
+    REPEATING RULE ROW (UI s4.4) - a repeat reads as a rule on the row itself.
+
+    DEPENDENCY-MODE REVIEW (doc 4 s7) - NEW ProtocolReviewScreen at
+    /(app)/clinical/protocol-review, reached from the protocol schedule screen.
+    When the protocol does not say whether a dependent visit counts from the
+    planned or the actual previous date, approval is correctly blocked - but
+    until now a reviewer could only unblock it through the API. Each of the three
+    choices states WHAT IT DOES to real visit dates, because that is the
+    difference being decided, not a preference.
+
+    APPLICABILITY REVIEW (doc 8 s33) - who each visit applies to, on the same
+    screen, so arm and cohort restrictions are checkable without reading raw
+    applicability expressions.
+
+    PATIENT TIMELINE (doc 1 s27) - the patient's visits in the order they happen,
+    toggled from the schedule table. Undated visits stay ON the timeline at the
+    end rather than disappearing: a visit waiting on an anchor is still part of
+    the patient's plan.
+
+    TESTS: uctsm-review-surfaces.test.ts (22), 62 frontend tests total
+
+B33. The Mongo cutover: parity gate and date overlay         <-- session 8
+    [D-1, the last structural blocker]
+
+    THE PROBLEM. Moving visit reads from the operational store to the engine
+    changes what a site sees for patients already enrolled. The ID bridge existed
+    (external_trial_id / external_patient_id, migration 0009), but nothing proved
+    the two systems agreed, and nothing stopped someone routing reads anyway.
+
+    THE PARITY GATE. app/domain/schedule/parity.py compares one patient's
+    schedule across both systems. It is deliberately unforgiving:
+      - a visit on one side and not the other is a DIFFERENCE, never an omission.
+        Two systems disagreeing about which visits EXIST is the worst failure
+        available and the easiest to hide by matching loosely
+      - one day of disagreement blocks. There is no tolerance setting, because
+        "close enough" is how a protocol window gets missed
+      - the engine REFUSING to date a visit legacy did date still blocks. It is
+        usually the engine being right - legacy substituted a date where no
+        anchor existed - but a site currently sees a date, so a person signs it
+        off rather than the system deciding
+      - two visits with the same name are reported AMBIGUOUS, never paired by
+        position. Pairing by list order is exactly the quiet guess this prevents
+      - an empty comparison is NOT_COMPARABLE, not a pass. Nothing to compare
+        proves nothing
+
+    THE CUTOVER RULE. Trial.schedule_read_mode defaults to LEGACY and moves to
+    ENGINE only when EVERY patient pinned to a version has a MATCHING recorded
+    run against THAT version. No override, no force flag. A trial where nine
+    patients matched and the tenth was never checked is not ready - the tenth is
+    the one who ends up on the wrong day. A new schedule version invalidates
+    earlier runs rather than carrying an old approval forward.
+
+    Moving BACK to LEGACY needs no gate at all, and that asymmetry is tested.
+    Reversing a cutover must never be harder than making one.
+
+    THE OVERLAY - why this is survivable. app/services/operational_read.py
+    overlays DATES ONLY. A visit_instance carries comments, tasks, workflow
+    state, who completed it; the engine has no equivalent and should not acquire
+    one. So:
+      - nothing is created and nothing is deleted. A read cannot lose a site's
+        comment thread, whatever the engine thinks
+      - reverting is instant and total, because the original dates were never
+        overwritten
+      - a visit the engine cannot date KEEPS its operational date and is flagged.
+        Blanking it would drop a visit from a site's list on a disagreement
+      - an engine visit with no operational document is REPORTED, not invented.
+        Creating one on read would give it no workflow history and no audit trail
+
+    LIVE WIRING. server.py gained one helper and two call sites (/visits/mine and
+    /patients/{id}/visits) - 59 added lines, 0 removed. It returns rows untouched
+    for any trial not cut over, which today is all of them, and also on any
+    failure: a schedule read must not break because the canonical side is down.
+
+    API: POST /patients/{id}/parity-check, GET+POST /trials/{id}/read-mode
+    DB: migration 20260901_0013 (schedule_read_mode, uctsm_parity_runs)
+    UI: toParityRows, describeReadiness
+    TESTS: test_uctsm_parity.py (15), test_uctsm_cutover.py (18),
+           test_uctsm_unscheduled_api.py (4 API-level),
+           uctsm-review-surfaces.test.ts (6)
+
+    NOT DONE, and deliberately: no trial has been cut over. The mechanism is
+    built and proven; running it against real trials is an operational decision
+    with real patients behind it, and it needs someone to look at the
+    differences the gate reports.
+
+B34. The last small requirement gaps                          <-- session 8
+    [doc 1 s21, doc 5 s26, doc 10 s3]
+
+    ANCHOR-CHANGE AUDIT (doc 1 s21). Confirming an anchor recorded only the new
+    value. "The anchor is 03-Nov" does not tell a reviewer that every dependent
+    visit moved by four days, so the audit now carries the value it REPLACED, and
+    a correction emits PATIENT_ANCHOR_CHANGED while a first recording emits
+    PATIENT_ANCHOR_CONFIRMED - two different events a reviewer can tell apart
+    while scanning a trail.
+
+    VISIT COMPLETION (doc 5 s26). "N of M required assessments complete", with
+    the outstanding ones named. OPTIONAL assessments are excluded from the
+    denominator on purpose: counting them makes a visit where everything required
+    was done read as incomplete, and a CRC chasing a false gap stops trusting the
+    number.
+
+    EVENT TYPE TAXONOMY (doc 10 s3). An event type outside the known set is a
+    non-blocking WARNING. Blocking would stop real work over vocabulary; treating
+    an unknown type as an ordinary site visit could tell a patient to travel.
+    Generic labels (VISIT, CONTACT, OTHER) are accepted because they are
+    presentation-SAFE - they promise nothing about how the patient attends, which
+    the visit-mode fields decide separately.
+
+    TESTS: uctsm-review-surfaces.test.ts (4), covered by the existing impact and
+           extraction suites for the other two.
+
+
+B35. Add Trial produces canonical schedule versions  [master prompt part 8.1/8.2]
+    app/services/canonical_import.py translates the live extractor's
+    CanonicalSchedulePlan into a UniversalSchedule, and app/services/
+    canonical_bridge.py persists it through the EXISTING ExtractionService.complete,
+    so version numbering, schedule-definition creation, the DRAFT lifecycle and
+    audit are the ones already built. No second extractor, no second persistence
+    path. POST /api/trials/{id}/uctsm-schedule runs it and is idempotent: a
+    retried Add Trial reuses the draft a reviewer may already be working on.
+    Every substudy schedule becomes its own canonical definition.
+    Nothing is invented: an unreadable timing stays UNRESOLVED, an unstated
+    window produces no window, a fractional offset is not rounded, a footnote
+    becomes an UNRESOLVED qualifier that BLOCKS approval, and an extraction
+    conflict becomes a blocking validation issue.
+    TESTS: backend/tests/test_canonical_import.py (20),
+           backend/tests/test_canonical_bridge.py (8)
+
+B36. The production journey runs on one engine  [master prompt part 11]
+    extract -> canonical draft -> review -> approve -> enrol -> patient schedule,
+    exercised against the real services. Proven refusals: an unapproved draft
+    cannot reach a patient; approval needs a per-field human review; an
+    unresolved footnote blocks approval; an anchor-based visit stays undated with
+    WAITING_FOR_ANCHOR instead of borrowing the baseline; an open-ended repeat
+    rolls to the horizon; a patient stays pinned to the version they enrolled
+    under when an amendment is approved.
+    TEST: backend/tests/test_canonical_journey.py (9)
+
+B37. Enrolment fixes found by B36
+    - POST /api/uctsm/trials wrote a PatientScheduleAssignment referencing an
+      undefined name (NameError on every canonical trial creation) and
+      create_patient had lost its assignment row. Moved back; without that row an
+      amendment silently re-dates a patient already on study.
+    - OperationalBridgeService ignored effective_from, so the LIVE Add Patient
+      path could enrol onto an amendment not yet in force while the canonical
+      endpoint refused. Both now apply the same doc 9 s8 rule.
+    TEST: backend/tests/test_uctsm_enrolment_api.py (3), journey suite
+
+B38. Protocol-driven Add Patient assignment  [master prompt part 8.5]
+    frontend/src/features/uctsm/ProtocolAssignmentFields.tsx renders ONLY the
+    dimensions the approved schedule defines (ARM, COHORT, PART, SEQUENCE,
+    SUBSTUDY or a term the protocol invented), narrowing dependants as they are
+    chosen, auto-recording a dimension with one possible value, and saying
+    plainly when the schedule is not approved yet rather than failing on submit.
+    Wired into the real clinical/add-patient.tsx, which now sends cohort_label
+    and dimension_values and suppresses its legacy arm/substudy pickers when the
+    canonical schedule owns those groupings.
+    TESTS: frontend/tests/uctsm-versions.test.ts (enrolment readiness)
+
+B39. Trial-level version screen and patient-level context  [part 8.8, Case 10]
+    ScheduleVersionsScreen (/(app)/sponsor/schedule-versions, reachable from the
+    trial summary for every role that can read the trial) lists every version
+    including superseded ones with their patient counts, and marks the one new
+    enrollments receive. GET /api/trials/{id}/uctsm-schedule serves it.
+    TESTS: frontend/tests/uctsm-versions.test.ts (9),
+           backend/tests/test_canonical_bridge.py::test_version_table_*
+
+B40. Protocol-level activity anchor table  [master prompt part 8.3, Case 6]
+    toProtocolActivityRows + ProtocolActivityTable render
+    Activity | Timing rule | Anchor | Window | Review on expansion of a
+    protocol-review row, from the canonical Activity.timing. No planned or actual
+    clock times: none exist before a patient does. An intra-day anchor names the
+    activity whose ACTUAL time it waits on.
+    TESTS: frontend/tests/uctsm-versions.test.ts (6)
+
+B41. Conditional requirements in the real patient flow  [part 8.6, Case 3]
+    PatientScheduleScreen now loads the patient's conditions, renders them in
+    their own table (never as dated rows), and on "Condition occurred" shows the
+    impact preview and requires an explicit confirmation before anything moves.
+    Cancelling discards the proposal. The patient record
+    (clinical/visit-detail.tsx) links to this screen once the patient is linked,
+    which is also how the day-wise activity table and confinement episodes became
+    reachable from the real PI/CRC flow (part 8.4, 8.7).
+
+
+C. PARTIAL
+==========
+
+C1. Repeating blocks
+    DONE:    per-event recurrence with horizon-bounded expansion (B8); block state
+             ACTIVE / PAUSED / STOPPED driven by conditions (B10); block validation;
+             rolling-horizon materialization with a continuing-repeat summary (B20);
+             NOMINAL / ACTUAL_RESUME / MANUAL / UNCLEAR resume semantics (B21).
+    MISSING: only the LIVE Mongo path, which still flattens an open-ended repeat to
+             12 preview rows. See D-3.
+
+C2. Extraction pipeline
+    DONE:    app/services/extraction_service.py + app/extraction/graph.py produce a
+             canonical schedule with evidence and claim links.
+    MISSING: it does not yet EMIT dependency_mode, conditional definitions,
+             qualifiers/markers with scope, activity applicability and intra-day
+             timing, confinement structure, generic dimensions, or conflicts. The
+             validator now BLOCKS approval when these are missing or unresolved, so
+             extraction has to start emitting them before a rich protocol can be
+             approved. Unclear meaning must be emitted as UNRESOLVED, never
+             defaulted. See D-2.
+
+C3. Active route UI
+    DONE:    the shared UCTSM table implements the full UI specification; Add Trial
+             routes to the UCTSM protocol review screen (B35), Add Patient reads
+             the approved schedule's groupings (B38), the trial summary opens the
+             version screen (B39), and the patient record opens the canonical
+             patient schedule with conditions, confinement and day-wise activities
+             (B41).
+    MISSING: sponsor/visit-schedule.tsx (the operational template editor) and
+             clinical/schedule-review.tsx still render their own tables, and
+             team-calendar still reads operational documents. These carry visit
+             WRITE features the engine has no equivalent for, so they stay where
+             they are until D-1 cuts a trial over. See D-4.
+
+C4. Audit coverage
+    DONE:    proposals, confirmations, condition state changes, activity records,
+             version assignment, schedule validation/approval/rejection, review
+             decisions, and every patient evaluation are audited.
+    MISSING: block state transitions and calendar/reminder reconciliation results
+             are not yet written as their own audit events. See D-6.
+
+
+D. NOT STARTED - PRIORITY ORDER
+===============================
+
+D-1  DONE (B33). The bridge, the parity gate, the read-mode switch and the
+         date overlay all exist and are tested. What remains is OPERATIONAL, not
+         engineering: run the parity check against real trials, have someone read
+         the differences it reports, and decide trial by trial whether to move.
+         Nothing has been cut over.
+
+D-2  DONE (B28). The provider exists and every category has a prompt. What is
+         untested is MODEL QUALITY on real protocols - the contract is proven, the
+         accuracy is not. Next step is an eval set of real schedule tables scored
+         against a reviewed answer, not more plumbing.
+
+D-3  P1  Replace the live path's preview-cycle materialization (see B14) with the
+         rolling horizon now in the engine (B20). The engine half is DONE; what
+         remains is that the LIVE extractor still flattens an open-ended repeat to
+         12 rows, which doc 3 s2 and s36 forbid presenting as the schedule.
+
+D-4  PARTIAL (B29, B35, B38-B41). Add Trial, Add Patient, the trial version
+         screen, the patient record's link into the canonical schedule, the
+         protocol-level activity/anchor table and conditional requirements are
+         wired. Still on the legacy Mongo API for READS AND WRITES: the visit
+         template editor, schedule-review and team-calendar. Those carry write
+         features the engine has no equivalent for, so they are blocked behind
+         D-1, not behind UI work.
+
+D-5  P2  Activity-level reminder rules where protocol meaning requires them
+         (the visit-level projection is done in B13).
+
+D-6  P2  Audit events for block state transitions and reminder/calendar
+         reconciliation (see C4).
+
+D-7  P2  Database immutability triggers for all child tables. Revision 0001 omits
+         activities, applicability, recurrence, and child records without a direct
+         schedule_version_id; add join-based trigger policies plus migration tests.
+
+D-8  P2  Test debt: concurrency/idempotency under load, real Postgres migration
+         tests, Mongo-to-UCTSM parity, time-zone/DST, multi-arm leakage,
+         end-to-end role tests, performance.
+
+
+E. VERIFICATION
+===============
+
+Backend gate: 424 passing, 0 failing (the list below):
+  cd backend
+  python -m pytest -q \
+    tests/test_uctsm_domain.py tests/test_uctsm_persistence.py \
+    tests/test_uctsm_workflow.py tests/test_uctsm_api_contract.py \
+    tests/test_uctsm_notifications.py tests/test_uctsm_extraction.py \
+    tests/test_uctsm_demo_api.py tests/test_uctsm_schedule_semantics.py \
+    tests/test_uctsm_impact.py tests/test_uctsm_activity_timing.py \
+    tests/test_uctsm_conditional_engine.py tests/test_uctsm_condition_workflow.py \
+    tests/test_uctsm_confinement.py tests/test_uctsm_projection.py \
+    tests/test_uctsm_deviation.py tests/test_uctsm_deviation_service.py \
+    tests/test_uctsm_dashboard.py tests/test_uctsm_footnote_completeness.py \
+    tests/test_uctsm_rolling_horizon.py tests/test_uctsm_event_types.py \
+    tests/test_uctsm_unscheduled_api.py tests/test_uctsm_anchor_status.py \
+    tests/test_uctsm_anchor_status_service.py tests/test_uctsm_enrolment.py \
+    tests/test_uctsm_assignment_impact.py \
+    tests/test_canonical_import.py tests/test_canonical_bridge.py     tests/test_canonical_journey.py tests/test_uctsm_enrolment_api.py     tests/test_patient_visit_anchor_safety.py tests/test_protocol_expansion.py \
+    tests/test_protocol_invariants.py tests/test_protocol_timing_contract.py \
+    tests/test_protocol_pattern_regressions.py tests/test_schedule_schema_v2.py
+
+Frontend (87 tests, all passing):
+
+  cd frontend
+  npm run test:uctsm          # presentation + tabular UI + visit timing
+  npx tsc --noEmit
+
+Migration chain (runs clean to head on a fresh sqlite database):
+
+  cd backend && alembic upgrade head
+
+KNOWN BASELINE CAVEATS - do not claim otherwise:
+  - A full `pytest` over the whole backend does NOT pass. Several TestClient-based
+    integration modules (test_schedule_edit.py, test_schedule_definition_api.py,
+    test_protocol_creation.py, ...) error during setup with an anyio/starlette
+    event-loop teardown problem when more than one such module runs in the same
+    session. Each module PASSES when run alone (test_schedule_edit.py: 18 passed).
+    This is pre-existing and unrelated to schedule logic. Only the suites listed
+    above are a trustworthy gate.
+  - `npm run lint` cannot execute: Expo invokes yarnpkg, which is not installed.
+  - `npx tsc --noEmit` over the WHOLE project dies with "Zone Allocation failed -
+    process out of memory" on this machine, at both default and 6 GB heap. It is
+    an environment limit, not a type error: a scoped tsconfig covering src/**,
+    tests/** and the edited app screens typechecks clean. Use a scoped config
+    until the full run is fixed, and do not report the OOM as a passing check.
+  - Node tests emit a harmless MODULE_TYPELESS_PACKAGE_JSON warning.
+
+
+F. WORKTREE OWNERSHIP / DO NOT OVERWRITE
+========================================
+These contain user or prior-agent work. Preserve and merge around them:
+  backend/server.py                                  (only narrow anchor-safety edits)
+  backend/tests/test_schedule_schema_v2.py
+  backend/tests/test_visit_instances.py
+  frontend/app/(app)/clinical/schedule-review.tsx
+  frontend/app/(app)/clinical/visit-detail.tsx
+  frontend/app/(app)/sponsor/visit-schedule.tsx
+  docs/mtb-system-dossier.md
+
+Planning artifacts (read before large changes):
+  docs/mtb-codebase-readiness-report.md   architecture + safety audit
+  docs/mtb-requirements-traceability.md   76-row requirement matrix
+                                          (NOTE: predates sessions 2-3; this
+                                          handoff supersedes its status column)
+  docs/mtb-implementation-plan.md         target architecture and sequencing
+
+FILES ADDED OR CHANGED IN SESSION 3
+-----------------------------------
+Added:
+  backend/app/domain/schedule/conditional.py
+  backend/app/services/schedule_projection.py
+  backend/alembic/versions/20260831_0005_patient_activities.py
+  backend/alembic/versions/20260831_0006_patient_conditions.py
+  backend/alembic/versions/20260831_0007_condition_anchor_source.py
+  backend/tests/test_uctsm_activity_timing.py
+  backend/tests/test_uctsm_conditional_engine.py
+  backend/tests/test_uctsm_condition_workflow.py
+  backend/tests/test_uctsm_confinement.py
+  backend/tests/test_uctsm_projection.py
+  frontend/tests/uctsm-tabular-ui.test.ts
+Changed:
+  backend/app/domain/schedule/{models,timing,evaluator,validator}.py
+  backend/app/db/{models,repositories}.py
+  backend/app/services/{schedule_service,impact_service}.py
+  backend/app/api/uctsm.py
+  backend/protocol_extraction.py, backend/schedule_schema.py   (preview-cap wording)
+  frontend/src/features/uctsm/{types,presentation,api}.ts, ScheduleTable.tsx
+  frontend/tests/uctsm-presentation.test.ts, frontend/package.json
+
+G. PER-REQUIREMENT COVERAGE AUDIT
+=================================
+Answer to "is every point done": NO. The canonical engine covers most of the
+scheduling SEMANTICS. Four cross-cutting capabilities are entirely absent, and the
+extraction and active-UI wiring that would make the engine usable on a real
+protocol are not built. Verified against the code on 31 Aug 2026.
+
+DOC 1  ANCHOR-BASED PATIENT VISIT SCHEDULING
+  DONE     no current-date fallback (B1); anchor resolves to NULL + AWAITING_ANCHOR;
+           only dependent events recalculated; completed visits protected; repeated
+           anchor changes reuse one occurrence with no duplicates; impact preview
+           before applying; patient-specific recalculation; extensible anchor types
+           including custom / event / condition-derived; circular-dependency
+           detection; backward compatibility with plain baseline offsets.
+  PARTIAL  s16 auto-derived anchors: derivation_rule and source_event_code exist and
+           the evaluator seeds anchors from event actuals, but the
+           "Last recorded dose = 03-Nov. Use this? [Confirm]" flow does not.
+           s21 audit: a correction emits PATIENT_ANCHOR_CHANGED carrying the
+           old AND new date; a first recording emits PATIENT_ANCHOR_CONFIRMED, so
+           a reviewer can tell them apart (B34).
+           s26 deviation reporting is DONE (B16); s22 anchor status vocabulary is
+           DONE as a derived view (B24) - PatientAnchor.status remains the
+           record-level lifecycle underneath it.
+           s27 patient timeline (B32).
+  MISSING  s24-25 reminder and calendar updates exist as a projection API but do
+           not reach the live product.
+
+DOC 2  CONDITIONAL / TRIGGERED VISIT AND SCHEDULE HANDLING
+  DONE     condition vs anchor separation; condition state machine; inactive
+           conditionals get no date, reminder, due or overdue status; impact shown
+           before apply; confirmation required; repeat-until-resolution; one-time vs
+           recurring; branch stop / pause / resume with stop terminal;
+           patient-specific impact; reversal preserves history; conditional
+           applicability by arm; MANUAL_REVIEW never invents a date; source evidence
+           enforced at approval.
+           s14 states: all seven, RECURRED included (B31).
+           s13 dashboard integration (B17, B29). s39 conditional deviation
+           handling (B16). s4-5 and s48 the extraction side that produces
+           conditional definitions (B28).
+  MISSING  s32 future automatic detection (explicitly out of scope for Phase 1).
+
+DOC 3  OPEN-ENDED / REPEATING SCHEDULE HANDLING
+  DONE     repeat rule stored rather than expanded; horizon-bounded generation;
+           protocol maximum honoured; no invented maximum; stop vs pause distinct;
+           multiple independent repeating blocks; completed cycles preserved when a
+           block stops; preview limit separated from the protocol definition (B14).
+  DONE     s7-8 rolling horizon: a bounded set of upcoming cycles, with the rule
+           that continues reported separately so the cap never reads as the
+           protocol maximum (B20). s20 resume timing: nominal grid, actual resume
+           date, or UNRESOLVED when the protocol did not say (B21). s28 dashboard
+           cycle view, correctly bounded (B17). s31 deviation handling (B16).
+           s27 cycle view: the repeating rule reads on the row and the
+           continuing-repeat footer states what carries on (B29, B32).
+  MISSING  nothing. The live extractor's open-ended expansion is capped at 4 and
+           labelled "PREVIEW ONLY ... cycle N is NOT the last cycle", and a
+           protocol-stated maximum overrides the cap (doc 3 s2, s36 honoured).
+
+DOC 4  NOMINAL VS ACTUAL PREVIOUS EVENT DEPENDENCY
+  DONE     all four modes; UNCLEAR blocked rather than guessed; only the dependency
+           chain recalculates; unrelated branches unmoved; completed visits
+           protected; impact preview before applying; per-block dependency mode;
+           version-scoped rule resolution.
+           s25 deviation reporting, comparing against the CURRENT expected
+           date rather than the original provisional one (B16).
+           s7 unclear-dependency review, with each choice stating what it does
+           to real visit dates (B32).
+  MISSING  nothing.
+
+DOC 5  ACTIVITY-LEVEL / INTRA-DAY TIMING
+  DONE     visit stays the parent; per-activity timing, anchor, offset, window,
+           sequence, status and actual time; multiple anchors per visit; arrival is
+           never the default; progressive generation; correcting an anchor moves only
+           pending activities; completed actual times never rewritten; unresolved
+           timing preserved rather than fabricated; per-occurrence separation in
+           recurring visits; append-only site records.
+           s26 visit completion: "N of M required assessments complete",
+           counting REQUIRED only so an optional assessment left undone does not
+           read as an incomplete visit (B34).
+           s25 PI/CRC dashboard (B17, B29). s13, s42-43 extraction of intra-day
+           timing, including activity-relative references (B28).
+  MISSING  s24 patient-facing view. Previously listed as missing, now done:
+           intra-day anchors from protocol wording.
+
+DOC 6  MULTI-DAY / INPATIENT / CONFINEMENT
+  DONE     one parent episode with child study days; clinical day numbering with no
+           Day 0; admission, dose and discharge kept distinct; IN_CONFINEMENT until
+           an ACTUAL discharge; planned vs actual preserved; conditional extension
+           moves discharge without creating a second episode; cohort applicability;
+           one multi-day calendar entry; internal study days suppressed from arrival
+           reminders.
+           s26 validation rules: distinct events, duplicate day numbers, Day 0,
+           unknown references and evidence, plus rules 1-3 - discharge before
+           admission, second admission before discharge, and overlapping episodes
+           (B19).
+           s23 repeated confinement periods: the model supports many episodes and
+           each is evaluated, but crossover Period 1/2/3 is untested.
+           s5-6 and s24 continuous stay vs re-admission is asked of the model
+           explicitly (B28). s17, s31 confinement expansion in the UI (B32).
+  MISSING  nothing structural.
+
+DOC 7  SCHEDULE TABLE FOOTNOTE AND QUALIFIER RESOLUTION
+  DONE     qualifier model with marker, text, scope, category, targets, resolution
+           and evidence; all 11 scopes and 12 categories; orphan and unresolved
+           qualifiers block approval; evidence required; qualifiers survive
+           persistence and reach the UI as indicators with a source panel.
+           s22-26 deterministic marker completeness, which blocks approval when a
+           detected marker never became a qualifier (B18). s27 contradiction
+           detection via check_qualifier_conflicts (B18). The LLM half that reads
+           what a footnote MEANS now exists (B28).
+  MISSING  nothing structural. What is unmeasured is whether the model resolves
+           footnote SCOPE correctly on real protocols - the deterministic check
+           catches a marker that vanished, not one mapped to the wrong cell.
+
+DOC 8  MULTI-ARM / COHORT / PART / SUBSTUDY APPLICABILITY
+  DONE     applicability at visit, activity, conditional and confinement level;
+           IN / NOT_IN operators; typed-condition rules; unknown values blocked;
+           patient schedule contains only applicable elements; master schedule keeps
+           all pathways.
+           s10 Part-to-Cohort hierarchy and s15-18 dependent enrolment fields
+           (B25). s21 open dimensions are stored per patient in dimension_values,
+           so PART / SEQUENCE / SUBSTUDY need no schema change per protocol.
+           s22 assignment-change impact preview with a stale-input guard (B26).
+           s30 an undefined group is refused rather than dropped.
+           the extraction side now emits dimension hierarchies, so a protocol's
+           parts and cohorts are related during extraction (B28).
+           s33 applicability review UI (B32).
+  MISSING  nothing.
+
+DOC 9  PROTOCOL AMENDMENT / SCHEDULE VERSION HANDLING
+  DONE     a new version never overwrites an approved one; patient pinned at
+           enrolment; existing patients never auto-migrated; new patients get the
+           current version; all engines resolve rules from the assigned version; old
+           versions retained; version locking; assignment audited; future migration
+           remains possible in the data model.
+           s10 typed schedule-comparison vocabulary, with clinical vs
+           administrative significance (B27).
+           s8 effective date, with enrolment refused before it (B31).
+           s12-13 patient-level version display (B32).
+  MISSING  s12 trial-level version display.
+
+DOC 10 DIFFERENT EVENT TYPES / VISIT MODE
+  DONE     event type drives reminder wording, attendance expectation and calendar
+           presentation; inactive unscheduled items produce no date, reminder, due or
+           overdue status; confinement reminder rules; Type column in the shared
+           table.
+           s13-15 unscheduled visit creation, end to end: the definition is
+           AVAILABLE_ON_DEMAND and never due, creating one is patient data that
+           reaches no other patient, a reason is mandatory, and a scheduled visit
+           cannot be created this way (B22). s31-32 hybrid modes preserved with no
+           default, and the mode actually used recorded per occurrence (B23).
+           s18/s33 an unstated mode stays unstated. s24 dashboard (B17).
+           s3 taxonomy: an event type outside the known set is surfaced as a
+           WARNING for a reviewer rather than blocked - a protocol may legitimately
+           name something new, and refusing approval over vocabulary would stop
+           real work (B34). s17-18 extraction of event mode from prose has both a
+           graph node and a provider (B28).
+  MISSING  nothing structural; the doc 10 gap is now extraction ACCURACY, not
+           capability.
+
+UI SPECIFICATION
+  DONE     one consistent tabular model; both master and patient column sets;
+           anchor-dependent rows read "Awaiting Last Dose Date"; conditional
+           requirements in their own table; expandable day-wise activity table;
+           qualifier indicators with source panel; status vocabulary from s6;
+           technical fields kept out of the main table (s7); mobile cards as a
+           responsive rendering of the same rows.
+           s4.4 repeating rule row; s4.5 impact preview table; s4.7 confinement
+           study-day expansion; s4.10 version context header (B32).
+  MISSING  three active route screens (visit-detail, schedule-review,
+           team-calendar) still render legacy tables. Their DATES now come from
+           the engine once a trial is cut over, because the overlay is applied at
+           the API (B33); their write features stay operational deliberately.
+
+CROSS-CUTTING CAPABILITIES - CURRENT STATE
+  1. DEVIATION DETECTION AND REPORTING (docs 1-6, 9).  BUILT (B16).
+     Computed, never stored, because the protocol-expected date moves when an
+     anchor is corrected. Reported on the patient schedule screen (B29).
+  2. EXTRACTION OF THE NEW SEMANTICS.  BUILT (B28).
+     Every semantic category has a prompt and a deterministic assembler. What is
+     NOT established is accuracy on real protocol PDFs - see the caveat below.
+  3. DASHBOARDS.  BUILT (B17), and consumed by a real screen (B29).
+     Bounded so an open-ended protocol cannot flood the board and an untriggered
+     conditional never appears.
+  4. THE LIVE PRODUCT BRIDGE.  STILL ABSENT.
+     No real patient in the Mongo/Expo product is served by the engine. Three
+     clinical screens still read the operational store.
+
+HONEST SUMMARY
+  Engine semantics        complete and tested against the requirement documents
+  Data model + validation complete
+  Extraction              built and safe when wrong; ACCURACY UNMEASURED
+  Active UI               patient schedule and action board consume the engine;
+                          visit-detail, schedule-review and team-calendar do not
+  Deviation               complete
+  Dashboards              complete
+  Live product            unchanged apart from the anchor-safety fix (B1) and the
+                          preview-cap wording (B14)
+
+  THE ONE CAVEAT WORTH READING TWICE
+  Every percentage in this file measures whether a REQUIREMENT IS IMPLEMENTED,
+  not whether the system is correct on a real protocol. Those are different
+  claims. The extraction provider is proven to fail safely - a bad citation is
+  dropped, an unparseable timing stays unresolved, an unreachable model produces
+  issues rather than an empty schedule. It is NOT proven to read a real
+  schedule-of-assessments table correctly, because no one has scored it against
+  one. Until that exists, treat every extracted schedule as a draft that a human
+  must review line by line, which is what the approval gate already enforces.
+
+H. COMPLETION ESTIMATE (re-measured after session 8)
+===================================================
+BASIS. Percentages count IMPLEMENTABLE RULES per requirement document - statements
+that can be built and tested. Background, worked examples and UX principles are
+excluded.
+
+BY LAYER:
+
+  Domain / engine semantics      ~98%
+  Data model + validation        ~97%
+  Deviation detection            ~95%
+  Dashboards                     ~90%
+  Extraction of new semantics    ~80%   built; ACCURACY UNMEASURED
+  Shared UI components           ~95%
+  Reminder / calendar            ~62%   projection complete; delivery is not
+  Active route UI                ~88%   (was 70) Add Trial, Add Patient, version
+                                        screen, patient record -> canonical
+                                        schedule, protocol activity/anchor table,
+                                        conditional requirements
+  Live product bridge            ~85%   (was 25) parity gate, read-mode switch
+                                        and date overlay, wired into both live
+                                        read endpoints. No trial cut over yet
+
+BY REQUIREMENT DOCUMENT:  unchanged from session 7 - this session built the
+  mechanism that lets the engine serve the live product, not new schedule rules.
+
+  OVERALL AGAINST THE FULL REQUIREMENT SET:  roughly 96%
+
+WHAT REMAINS (re-checked 4 September 2026)
+  0. NOT DONE from the master prompt's part 8, and deliberately so:
+     - 8.9  reminder/calendar DELIVERY still does not consume the schedule
+            projection. The projection is complete; the notification and calendar
+            consumers have not been changed to read it.
+     - 8.10 the auto-derived anchor suggestion ("MTB detected Last Dose =
+            03-Nov-2026. Use this date? [Cancel] [Confirm]") does not exist. The
+            derivation data is there (derivation_rule, source_event_code); the
+            confirm prompt is not.
+     - 8.11 no trial has been cut over. Building a canonical draft for a NEW
+            trial is not a cutover, and existing trials still read from Mongo.
+  1. EXTRACTION ACCURACY. The provider fails safely; it is not proven to read a
+     real schedule-of-assessments table correctly. Needs an eval set of real
+     protocol PDFs with reviewed answers, scored. This is the one genuine
+     engineering gap left.
+  2. RUNNING THE CUTOVER. Operational, not engineering. For each trial: link it,
+     run the parity check per patient, read the differences, decide. The gate
+     refuses until every patient matches, so the work is reviewing differences -
+     which is the work it should be.
+  3. The operational template editor, schedule-review and team-calendar still
+     read operational documents - but their DATES now come from the engine once a
+     trial is cut over, because the overlay is applied at the API. Their write
+     features stay on the operational store deliberately: the engine has no
+     equivalent for comments, tasks or visit edits, and should not acquire one.
+  4. See item 0 above for the three master-prompt items not attempted.
+
+END OF HANDOFF

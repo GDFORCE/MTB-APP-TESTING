@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.domain.schedule.models import UniversalSchedule, ValidationIssue
 from app.domain.schedule.validator import ScheduleValidator
+from app.extraction.completeness import run_completeness_checks
 
 
 class DocumentPage(BaseModel):
@@ -107,10 +108,19 @@ def build_extraction_graph(provider: ExtractionProvider):
             }
             return {"issues": [*state.get("issues", []), issue], "trace": _append_trace(state, "FINAL_VALIDATION", {"valid": False})}
         deterministic = [item.model_dump(mode="json") for item in ScheduleValidator().validate(schedule)]
+        # Prove nothing the document contained was silently dropped: every table
+        # marker and footnote must have resolved into schedule meaning (doc 7 s22).
+        completeness = [
+            item.model_dump(mode="json")
+            for item in run_completeness_checks(schedule, state.get("pages", []))
+        ]
         return {
             "schedule": schedule.model_dump(mode="json"),
-            "issues": [*state.get("issues", []), *deterministic],
-            "trace": _append_trace(state, "FINAL_VALIDATION", {"valid": True, "issues": len(deterministic)}),
+            "issues": [*state.get("issues", []), *deterministic, *completeness],
+            "trace": _append_trace(state, "FINAL_VALIDATION", {
+                "valid": True, "issues": len(deterministic),
+                "completeness_findings": len(completeness),
+            }),
         }
 
     nodes = [
@@ -121,11 +131,22 @@ def build_extraction_graph(provider: ExtractionProvider):
         ("dimensions", claims_node("arms_cohorts_populations")),
         ("anchors", claims_node("anchors")),
         ("events", claims_node("events")),
+        # Doc 10 s2-s3 and s31-s33. Separate from "events" because the mode is
+        # rarely in the schedule table: it comes from the surrounding protocol
+        # text, and getting it wrong sends a patient travelling.
+        ("event_types", claims_node("event_types")),
         ("timing", claims_node("timing")),
         ("conditions", claims_node("conditions")),
         ("dependencies", claims_node("dependencies")),
+        ("dependency_modes", claims_node("dependency_modes")),
         ("recurrence", claims_node("recurrence")),
+        ("repeat_blocks", claims_node("repeat_blocks")),
         ("activities", claims_node("activities")),
+        ("activity_timing", claims_node("activity_timing")),
+        ("qualifiers", claims_node("qualifiers")),
+        ("conditional_actions", claims_node("conditional_actions")),
+        ("conditional_resolution", claims_node("conditional_resolution")),
+        ("confinement", claims_node("confinement")),
         ("relationships", relationships),
         ("evidence_linking", evidence_linking),
         ("completeness", reasoning_check("COMPLETENESS_CHECK", provider.completeness_check)),
@@ -175,4 +196,3 @@ def run_extraction(
                 details={"raw": value},
             ))
     return ExtractionResult(schedule=schedule, issues=issues, extraction_trace=state.get("trace", []))
-

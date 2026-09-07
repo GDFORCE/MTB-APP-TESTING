@@ -57,6 +57,8 @@ test("protocol adapter renders readable schedule rows without visit-gap fields",
   assert.equal(row.window, "-2 weeks/+2 weeks");
   assert.equal(row.type, "Telephone");
   assert.deepEqual(row.activities, ["Safety Assessment"]);
+  assert.equal(row.appliesTo, "All enrolled patients");
+  assert.equal(row.status, "Confirmed");
   assert.equal("visit_gap_days" in row, false);
 });
 
@@ -74,14 +76,21 @@ test("patient adapter displays backend dates and friendly states", () => {
       nominal_start_date: "2026-09-01",
       earliest_date: "2026-08-30",
       latest_date: "2026-09-03",
+      actual_date: "2026-09-02",
     }],
   }, protocolRows);
   assert.equal(row.expectedDate, "1 Sep 2026");
   assert.equal(row.allowedWindow, "30 Aug 2026 – 3 Sep 2026");
-  assert.equal(row.status, "Waiting for condition");
+  assert.equal(row.actualDate, "2 Sep 2026");
+  // UI specification section 6 status vocabulary: a conditional item that has not
+  // been triggered for this patient is "Inactive", not overdue and not pending.
+  assert.equal(row.status, "Inactive");
 });
 
 test("enum labels are presentation-only and human readable", () => {
   assert.equal(displayVisitType("ONSITE/TELEPHONE"), "Site / Telephone");
   assert.equal(displayPatientState("HUMAN_REVIEW_REQUIRED"), "Review required");
+  assert.equal(displayPatientState("WAITING_FOR_ANCHOR"), "Awaiting Anchor");
+  assert.equal(displayPatientState("PAUSED"), "Paused");
+  assert.equal(displayPatientState("CANCELLED"), "Cancelled");
 });

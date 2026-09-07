@@ -14,7 +14,7 @@ from app.domain.schedule.condition import (
 from app.domain.schedule.evaluator import ScheduleEvaluator, add_amount, evaluate_timing
 from app.domain.schedule.exceptions import ScheduleNotApprovedError
 from app.domain.schedule.models import (
-    Anchor, ClaimEvidence, Dependency, Event, Evidence, PatientContext,
+    Anchor, ClaimEvidence, Dependency, DependencyMode, Event, Evidence, PatientContext,
     PatientEventStatus, RecurrenceRule, RecurrenceTermination,
     ScheduleMetadata, ScheduleStatus, UniversalSchedule,
 )
@@ -50,6 +50,8 @@ def schedule_with(event: Event, *, status=ScheduleStatus.APPROVED) -> UniversalS
         (event.conditions, "CONDITION", "conditions"),
         (event.applicability, "APPLICABILITY", "applicability"),
         (event.recurrence, "RECURRENCE", "recurrence"),
+        (event.dependencies, "DEPENDENCY", "dependencies"),
+        (event.dependency_mode, "DEPENDENCY_MODE", "dependency_mode"),
     ):
         if present:
             claims.append(ClaimEvidence(
@@ -221,6 +223,82 @@ def test_dependency_cycle_is_blocking():
     schedule = schedule_with(a, status=ScheduleStatus.DRAFT)
     schedule.events.append(b)
     assert any(item.issue_code == "CIRCULAR_DEPENDENCY" for item in ScheduleValidator().validate(schedule))
+
+
+def test_dependency_mode_distinguishes_nominal_from_actual_previous_event():
+    source = Event(
+        code="DOSE", protocol_label="Dose", display_name="Dose", event_type="TREATMENT",
+        timing=OffsetTiming(
+            reference=AnchorReference(code="BASELINE"),
+            offset=TemporalAmount(value=0, unit="DAY"),
+        ),
+    )
+    follow_up = Event(
+        code="FOLLOW_UP", protocol_label="Follow-up", display_name="Follow-up", event_type="VISIT",
+        timing=OffsetTiming(
+            reference=EventReference(event_code="DOSE"),
+            offset=TemporalAmount(value=7, unit="DAY"),
+        ),
+        dependencies=[Dependency(source_event_code="DOSE", dependency_type="TEMPORAL")],
+        dependency_mode=DependencyMode.NOMINAL,
+    )
+    schedule = schedule_with(follow_up)
+    source.evidence_refs = list(follow_up.evidence_refs)
+    schedule.events.insert(0, source)
+    for claim_type, path in (("EVENT_NAME", "display_name"), ("TIMING", "timing")):
+        schedule.claim_evidence.append(ClaimEvidence(
+            evidence_id=schedule.evidence[0].id, claim_type=claim_type,
+            claim_entity_type="EVENT", claim_entity_id=source.id, claim_path=path,
+        ))
+    patient_context = context(
+        schedule,
+        actual_event_values={"DOSE": [date(2026, 1, 5)]},
+    )
+
+    nominal = ScheduleEvaluator().evaluate(
+        schedule, patient_context, horizon=date(2026, 12, 31),
+    )
+    assert nominal.events[1].timing.nominal_start == date(2026, 1, 8)
+
+    schedule.events[1].dependency_mode = DependencyMode.ACTUAL_PREVIOUS_EVENT
+    actual = ScheduleEvaluator().evaluate(
+        schedule, patient_context, horizon=date(2026, 12, 31),
+    )
+    assert actual.events[1].timing.nominal_start == date(2026, 1, 12)
+    assert actual.events[1].dependency_result["mode"] == "ACTUAL_PREVIOUS_EVENT"
+
+
+def test_actual_previous_dependency_waits_for_recorded_actual():
+    event = Event(
+        code="FOLLOW_UP", protocol_label="Follow-up", display_name="Follow-up", event_type="VISIT",
+        timing=OffsetTiming(
+            reference=EventReference(event_code="DOSE"),
+            offset=TemporalAmount(value=7, unit="DAY"),
+        ),
+        dependencies=[Dependency(source_event_code="DOSE", dependency_type="TEMPORAL")],
+        dependency_mode=DependencyMode.ACTUAL_PREVIOUS_EVENT,
+    )
+    schedule = schedule_with(event)
+    source = Event(
+        code="DOSE", protocol_label="Dose", display_name="Dose", event_type="TREATMENT",
+        timing=OffsetTiming(
+            reference=AnchorReference(code="BASELINE"),
+            offset=TemporalAmount(value=0, unit="DAY"),
+        ), evidence_refs=list(event.evidence_refs),
+    )
+    schedule.events.insert(0, source)
+    for claim_type, path in (("EVENT_NAME", "display_name"), ("TIMING", "timing")):
+        schedule.claim_evidence.append(ClaimEvidence(
+            evidence_id=schedule.evidence[0].id, claim_type=claim_type,
+            claim_entity_type="EVENT", claim_entity_id=source.id, claim_path=path,
+        ))
+
+    result = ScheduleEvaluator().evaluate(
+        schedule, context(schedule), horizon=date(2026, 12, 31),
+    )
+
+    assert result.events[1].status == PatientEventStatus.BLOCKED
+    assert result.events[1].dependency_result["waiting_for_actual"] == ["DOSE"]
 
 
 def test_non_approved_schedule_cannot_generate_patient_dates():

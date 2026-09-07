@@ -458,7 +458,10 @@ canonical_plan.conflicts instead of choosing one silently. Define arms, cohorts,
 and treatment sequences as branches and express "if/when/only for" applicability as
 conditions rather than deleting conditional visits.
 
-Preserve each exact timing string in source_day_label. Set anchor_study_day to 0 or 1 and
+Preserve each exact timing string in source_day_label, but exclude any window suffix
+printed alongside it ("Day 5 +/- 3 days" -> source_day_label "Day 5", window_days 3) -
+the window belongs in window_days/window_before/window_after, never appended to the day
+label itself. Set anchor_study_day to 0 or 1 and
 includes_day_zero only when supported by the protocol. Derive simple Day D offsets using:
 anchor Day 0 -> D; anchor Day 1 with Day 0 -> D-1; anchor Day 1 without Day 0 -> D-1 for
 D>=1 and D for negative D. Day 0 is invalid in the no-Day-0 convention. Do not blindly
@@ -476,7 +479,11 @@ ID, leave it unresolved or empty rather than guessing.
 
 For collapsed cycles, emit recurrence rules in canonical_plan; do not populate legacy
 repeating_blocks and do not enumerate repeated cycles manually. Use separate recurrence
-rules when cadence changes. Put cycle-specific procedures in conditions. Duplicate events
+rules when cadence changes. When the protocol states the cadence ITSELF as a range
+("every 3-4 months", "every 1-2 weeks", "every 6-12 months") rather than one fixed
+number, set frequency.value to the lower bound and frequency.value_max to the upper
+bound - never silently pick one number, average the range, or drop the other bound.
+Put cycle-specific procedures in conditions. Duplicate events
 by arm only when timing genuinely differs, and label crossover periods, washouts, and
 extensions. Include early termination, unscheduled, telephone, and safety follow-up
 events when present.
@@ -623,7 +630,14 @@ Score these dimensions INDEPENDENTLY:
    anchor/dosing day and silently dropped from the trailing day(s) the source names just as
    explicitly (a PK-sampling profile whose last timepoints land on the following calendar day
    is a frequent real example: the source table lists it as spanning both days for exactly
-   that reason).
+   that reason). Also check every recurring lab/assessment/imaging cadence against its
+   OWN source text specifically for a stated RANGE ("every 1-2 weeks", "every 3-4 months",
+   "every 6-12 months") rather than one fixed number: a recurrence.frequency with a single
+   value but no value_max, next to source text that plainly states two different bounds, is
+   a confirmed defect — the range must be recorded via value_max, never collapsed to one
+   picked number, an average, or silently dropped. This is the single most common way a
+   tapering or de-escalating monitoring schedule (frequent labs early, sparser later) loses
+   real visit burden: the model resolves the ambiguity itself instead of surfacing it.
 3. WINDOWS — is every symmetric or asymmetric +/- visit window preserved correctly?
 4. VISIT TYPE — is each site, virtual, telephone, home, unscheduled, and other visit type
    classified correctly from the protocol?
@@ -1181,6 +1195,15 @@ _NAMED_DAY_LIST = re.compile(
     re.IGNORECASE,
 )
 
+# "every 3-4 months", "every 1 to 2 weeks", "6-12 months" - a recurrence's
+# OWN source label stating its cadence as two different bounds rather than
+# one fixed number.
+_RANGE_CADENCE_LABEL = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*(\d+(?:\.\d+)?)\s*"
+    r"(?:day|week|month|year)s?",
+    re.IGNORECASE,
+)
+
 
 def _named_day_lists(text: str) -> list[list[int]]:
     """Every 'Day 30 & 31' / 'day 27, 28, 29'-shaped span naming 2+ distinct
@@ -1289,6 +1312,24 @@ def _structural_issues(schedule: ExtractedSchedule) -> list[str]:
     plan = schedule.canonical_plan
     if plan is not None:
         for recurrence in plan.recurrences:
+            # The protocol's own source text stated a RANGE cadence ("every 3-4
+            # months", "every 1-2 weeks") but frequency only ever holds one
+            # number — value_max exists precisely so that range is not lost.
+            # A recurrence whose own source_label plainly states two different
+            # bounds, with value_max still null, means the model picked one
+            # number and quietly dropped the other rather than recording both.
+            # Checked for every unit, not just day/week, since the real-world
+            # cases (bone marrow/PCR cadence) are stated in months.
+            range_match = _RANGE_CADENCE_LABEL.search(recurrence.source_label or "")
+            if range_match and recurrence.frequency.value_max is None:
+                low, high = float(range_match.group(1)), float(range_match.group(2))
+                if low != high:
+                    issues.append(
+                        f"recurrence '{recurrence.source_label}' states a range "
+                        f"cadence ({low:g}-{high:g} {recurrence.frequency.unit}) but "
+                        f"frequency was recorded as a single {recurrence.frequency.value:g} "
+                        f"{recurrence.frequency.unit} with no value_max — set value_max "
+                        "to the stated upper bound instead of silently picking one number")
             if recurrence.frequency.unit not in ("day", "week"):
                 continue
             for event_id in recurrence.event_ids:

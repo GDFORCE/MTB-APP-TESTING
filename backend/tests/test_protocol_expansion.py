@@ -86,6 +86,41 @@ def test_positive_day_is_safe_when_day_zero_presence_is_unknown():
         "Day -1", anchor_study_day=1, includes_day_zero=None) is None
 
 
+def test_a_window_suffix_printed_alongside_the_day_number_does_not_block_the_cross_check():
+    """Real protocol text (NCT00129740 s7.7): 'EKG on day 5 +/- 3 days of
+    therapy'. A model that copies the whole phrase into source_day_label,
+    rather than splitting the window into window_days, must not silently
+    skip the deterministic offset cross-check just because the label carries
+    trailing window text alongside the day number - that is exactly the gap
+    that let a wrong offset (4, not 5) through unchecked on this protocol."""
+    assert simple_day_label_offset(
+        "Day 5 +/- 3 days", anchor_study_day=0, includes_day_zero=True) == 5
+    assert simple_day_label_offset(
+        "day 5 +/-3 days", anchor_study_day=0, includes_day_zero=True) == 5
+    assert simple_day_label_offset(
+        "Day 5 (+/- 3d)", anchor_study_day=0, includes_day_zero=True) == 5
+    assert simple_day_label_offset(
+        "Day 5 ± 3 days", anchor_study_day=0, includes_day_zero=True) == 5
+    # Same suffix tolerance under the Day-1 anchor convention.
+    assert simple_day_label_offset(
+        "Day 5 +/- 3 days", anchor_study_day=1, includes_day_zero=False) == 4
+
+
+def test_a_window_suffix_on_a_day_range_label_is_also_tolerated():
+    assert simple_day_label_range_offsets(
+        "Day 12-14 +/- 2 days", anchor_study_day=0, includes_day_zero=True
+    ) == (12, 14)
+
+
+def test_a_day_label_followed_by_unrelated_prose_is_still_not_derived():
+    """The widened suffix must stay narrow: real prose after the day number
+    (not a window annotation) must still fall through to manual review,
+    exactly as before this fix."""
+    convention = {"anchor_study_day": 0, "includes_day_zero": True}
+    assert simple_day_label_offset("Day 5 or the next business day", **convention) is None
+    assert simple_day_label_offset("Day 5 to Day 8", **convention) is None
+
+
 def test_exact_day_with_unknown_anchor_is_retained_but_needs_review():
     out = expand_schedule(ExtractedSchedule(
         anchor_study_day=None,

@@ -5,7 +5,12 @@ from pathlib import Path
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
 
-from protocol_extraction import ExtractedSchedule, expand_schedule  # noqa: E402
+from protocol_extraction import (  # noqa: E402
+    ExtractedSchedule,
+    RepeatingBlock,
+    RepeatMember,
+    expand_schedule,
+)
 from schedule_schema import (  # noqa: E402
     CanonicalSchedulePlan,
     DocumentTaskClassification,
@@ -151,6 +156,63 @@ def test_open_ended_recurrence_is_retained_and_forces_review():
 
     issues = validate_canonical_plan(plan)
     assert any("open-ended" in issue for issue in issues)
+
+
+def test_range_cadence_recurrence_flags_every_occurrence_row_for_review():
+    """NCT00129740 s7.3: 'Bone marrow aspirate...every 3-4 months' during year 1.
+
+    A recurrence whose frequency carries a value_max (a stated range the
+    extraction captured, e.g. 3-4 months) must not silently produce rows that
+    look like ordinary fixed-interval visits — each generated occurrence has
+    to carry a reviewer-visible note and a review flag, since the row's own
+    day_offset is only one illustrative point inside the stated range.
+    """
+    plan = CanonicalSchedulePlan(
+        anchors=[ScheduleAnchor(
+            id="anchor-baseline", name="Baseline", anchor_type="first_dose")],
+        events=[ScheduleEvent(
+            id="event-bma", name="Bone Marrow Aspirate",
+            timing=TimingExpression(
+                kind="offset", anchor_id="anchor-baseline",
+                offset=TemporalAmount(value=0, unit="day")))],
+        recurrences=[RecurrenceRule(
+            id="recurrence-bma", event_ids=["event-bma"],
+            frequency=TemporalAmount(value=3, unit="month", value_max=4),
+            start_occurrence=1, end_occurrence=3,
+            source_label="Bone marrow aspirate every 3-4 months")])
+
+    rows, _warnings = project_canonical_plan(plan)
+
+    assert len(rows) == 3
+    for row in rows:
+        assert row["extraction_warning"] is True
+        assert row["review_status"] == "pending"
+        assert any(
+            "3-4 months" in note and "Bone marrow aspirate every 3-4 months" in note
+            for note in row["operational_constraints"]
+        )
+
+
+def test_fixed_cadence_recurrence_without_value_max_is_not_flagged_by_this_check():
+    plan = CanonicalSchedulePlan(
+        anchors=[ScheduleAnchor(
+            id="anchor-baseline", name="Baseline", anchor_type="first_dose")],
+        events=[ScheduleEvent(
+            id="event-cbc", name="CBC",
+            timing=TimingExpression(
+                kind="offset", anchor_id="anchor-baseline",
+                offset=TemporalAmount(value=0, unit="day")))],
+        recurrences=[RecurrenceRule(
+            id="recurrence-cbc", event_ids=["event-cbc"],
+            frequency=TemporalAmount(value=2, unit="week"),
+            start_occurrence=1, end_occurrence=2,
+            source_label="CBC every 2 weeks")])
+
+    rows, _warnings = project_canonical_plan(plan)
+
+    for row in rows:
+        assert not any(
+            "not a fixed interval" in note for note in row["operational_constraints"])
 
 
 def test_conflicts_and_invalid_references_are_not_silently_accepted():
@@ -367,3 +429,30 @@ def test_canonical_range_timing_correction_requires_anchor_metadata():
     assert rows[0]["day_offset"] == 11
     assert rows[0]["day_end"] == 13
     assert warnings == []
+
+
+def test_editor_payload_carries_extraction_assumptions_to_the_reviewer():
+    """The open-ended-cycle / unresolved-anchor notes must reach the client.
+
+    expand_schedule records what it had to assume; the sponsor's schedule
+    editor renders those notes so they are confirmed before saving. If the
+    API response contract drops them, that warning is silently lost.
+    """
+    import server
+
+    schedule = ExtractedSchedule(
+        repeating_blocks=[
+            RepeatingBlock(
+                from_cycle=1, to_cycle=None, cycle_length_days=21,
+                first_cycle_start_day=0,
+                members=[RepeatMember(name_template="Cycle {cycle} Day 1",
+                                      day_within_cycle=0)]),
+        ],
+    )
+    expanded = expand_schedule(schedule)
+    assert any('open-ended' in note for note in expanded.assumptions), expanded.assumptions
+
+    payload = server._schedule_extraction_payload(expanded)
+    assert payload['assumptions'] == expanded.assumptions
+    assert any('Confirm the real number before saving' in note
+               for note in payload['assumptions'])

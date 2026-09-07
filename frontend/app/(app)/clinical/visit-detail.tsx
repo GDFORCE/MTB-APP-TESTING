@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { View, ScrollView, StyleSheet, Pressable, Modal, Text, TextInput, ActivityIndicator, Linking } from "react-native";
 import { useRouter, useLocalSearchParams } from "expo-router";
 import { LinearGradient } from "expo-linear-gradient";
-import { Phone, MessageCircle, Calendar as CalIcon, Check, CheckCircle2, ChevronDown, Clock3, FileText, Send, X } from "lucide-react-native";
+import { Phone, MessageCircle, Calendar as CalIcon, CalendarPlus, Check, CheckCircle2, ChevronDown, Clock3, FileText, Plus, Send, Trash2, X } from "lucide-react-native";
 import { colors, spacing, radii, dawnGradient } from "@/src/theme/tokens";
 import { Eyebrow, H1, Body, Small, Card, Button } from "@/src/components/ui";
 import { ScreenContainer, ScreenHeader } from "@/src/components/ScreenHeader";
@@ -49,6 +49,15 @@ type Instance = {
   completed_by_name?: string | null;
   completed_at?: string | null;
   visit_type?: string;
+  window_days?: number | null;
+  // Set when the protocol timing could not be resolved to a date for this
+  // patient (an undated Early Termination / Unscheduled visit, an anchor the
+  // schedule never pins down). The visit is still created — dateless.
+  manual_review_reason?: string | null;
+  // An extra visit added for THIS patient only (an unplanned safety check, a
+  // repeat lab, a re-consent) rather than one of the protocol's own visits.
+  unscheduled?: boolean;
+  unscheduled_reason?: string | null;
 };
 
 // Statuses the PATCH /visit-instances/{id} endpoint accepts; surfaced as chips.
@@ -67,6 +76,32 @@ function fmtInstantDate(iso?: string | null): string {
 }
 
 const fmtScheduleDate = (iso?: string | null) => formatIsoCalendarDate(iso, "—");
+
+// The server returns a patient's visits in calendar order (undated ones last).
+// An added visit is applied optimistically, so the same order is reproduced
+// here — otherwise a visit added mid-schedule would flash at the bottom of the
+// list before the reload put it back where its date belongs.
+function orderVisits(list: Instance[]): Instance[] {
+  const key = (visit: Instance) => {
+    const time = Date.parse(visit.scheduled_date || "");
+    const seq = Number(visit.seq ?? visit.visit_number ?? 0);
+    return Number.isNaN(time)
+      ? { dated: 1, time: Number.MAX_SAFE_INTEGER, seq }
+      : { dated: 0, time, seq: Number.isNaN(seq) ? 0 : seq };
+  };
+  return [...list].sort((left, right) => {
+    const a = key(left), b = key(right);
+    return a.dated - b.dated || a.time - b.time || a.seq - b.seq;
+  });
+}
+
+// What the VISIT column reads for a row. A protocol visit keeps the number the
+// site knows it by; an added visit has no protocol number, so it says what it
+// is instead of borrowing (and shifting) its neighbours' numbering.
+const visitLabel = (visit: Instance) =>
+  visit.unscheduled ? "Extra" : `Visit ${visit.seq ?? visit.visit_number ?? "—"}`;
+
+const todayISO = () => new Date().toISOString().slice(0, 10);
 
 function pillFor(status: string): { label: string; bg: string; fg: string } {
   switch (status) {
@@ -106,6 +141,12 @@ export default function ClinicalVisitDetail() {
   // Error surfaced INSIDE the update sheet (the full-screen modal covers the
   // main-scroll error card, so a save failure must render within the sheet).
   const [sheetError, setSheetError] = useState<string | null>(null);
+  // Add-visit sheet: one extra dated visit for this patient only.
+  const [addOpen, setAddOpen] = useState(false);
+  const [addForm, setAddForm] = useState({ name: "", dateISO: "", windowDays: "0", reason: "" });
+  const [addSaving, setAddSaving] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+  const [removing, setRemoving] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -117,7 +158,7 @@ export default function ClinicalVisitDetail() {
       ]);
       setPatient(detail.data);
       setTrial(detail.data?.trial || null);
-      setVisits(timeline.data || []);
+      setVisits(orderVisits(timeline.data || []));
     } catch {
       setError("Couldn't load this patient. Please try again.");
     } finally {
@@ -127,13 +168,15 @@ export default function ClinicalVisitDetail() {
 
   useEffect(() => { load(); }, [load]);
 
+  // Re-ordered on every write: re-dating a visit moves it to where that date
+  // now falls in the schedule, the same way the server orders it on reload.
   const applyLocal = (instId: string, patch: Partial<Instance>) => {
-    setVisits(list => list.map(v => (v.id === instId ? { ...v, ...patch } : v)));
+    setVisits(list => orderVisits(list.map(v => (v.id === instId ? { ...v, ...patch } : v))));
     setEditing(current => current?.id === instId ? { ...current, ...patch } : current);
   };
 
   const applyServerInstance = (updated: Instance) => {
-    setVisits(list => list.map(v => (v.id === updated.id ? updated : v)));
+    setVisits(list => orderVisits(list.map(v => (v.id === updated.id ? updated : v))));
     setEditing(current => current?.id === updated.id ? updated : current);
   };
 
@@ -189,6 +232,65 @@ export default function ClinicalVisitDetail() {
       setSheetError("Couldn't save the visit update. Check the date (YYYY-MM-DD) and try again.");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const openAddSheet = () => {
+    setAddError(null);
+    setAddForm({ name: "", dateISO: todayISO(), windowDays: "0", reason: "" });
+    setAddOpen(true);
+  };
+
+  // Add one extra visit to THIS patient's schedule. The server places it by
+  // its date — between the two protocol visits it falls between — and returns
+  // the saved row, which is merged back in the same calendar order.
+  const addVisit = async () => {
+    if (addSaving) return;
+    const name = addForm.name.trim();
+    const dateISO = addForm.dateISO.trim();
+    if (!name) { setAddError("Give the visit a name."); return; }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateISO) || Number.isNaN(Date.parse(dateISO))) {
+      setAddError("Enter the visit date as YYYY-MM-DD."); return;
+    }
+    const windowDays = Number(addForm.windowDays || 0);
+    if (!Number.isInteger(windowDays) || windowDays < 0 || windowDays > 365) {
+      setAddError("The window must be a whole number of days (0–365)."); return;
+    }
+    setAddSaving(true);
+    setAddError(null);
+    try {
+      const response = await api.post(`/patients/${id}/visits`, {
+        name,
+        scheduled_date: dateISO,
+        window_days: windowDays,
+        reason: addForm.reason.trim() || undefined,
+      });
+      animateNextLayout();
+      setVisits(list => orderVisits([...list, response.data]));
+      setScheduleOpen(true);
+      setExpandedScheduleVisit(response.data?.id ?? null);
+      setAddOpen(false);
+    } catch {
+      setAddError("Couldn't add this visit. Check the date and try again.");
+    } finally {
+      setAddSaving(false);
+    }
+  };
+
+  // Only ever an added visit — a protocol visit is cancelled via its status.
+  const removeVisit = async (inst: Instance) => {
+    if (removing) return;
+    const previous = visits;
+    setRemoving(inst.id);
+    animateNextLayout();
+    setVisits(list => list.filter(v => v.id !== inst.id));
+    try {
+      await api.delete(`/patients/${id}/visits/${inst.id}`);
+    } catch {
+      setVisits(previous);
+      setError("Couldn't remove that visit. Please try again.");
+    } finally {
+      setRemoving(null);
     }
   };
 
@@ -299,15 +401,52 @@ export default function ClinicalVisitDetail() {
           <View style={s.finalHeroTop}><View style={s.finalIdentity}><View style={s.finalAvatar}><Body weight="700" color={colors.primaryFg}>{patient.avatar_initials || (patient.full_name || "?").slice(0, 2).toUpperCase()}</Body></View><View><Body weight="700" color={colors.primaryFg}>{patient.avatar_initials || "Participant"}</Body><Small color={colors.overlay25}>{patient.subject_id || `SUBJ-${String(patient.id).slice(-3)}`}{patient.age ? ` · Age ${patient.age}` : ""}</Small></View></View><View style={s.finalStatus}><Small color={colors.primaryFg} weight="700">{recordStatus.label}</Small></View></View>
           <View style={s.finalGrid}>{[
             { label: "PROTOCOL", value: trial?.protocol_id || "—" }, { label: "SITE", value: trial?.site_names?.[0] || patient.site_name || "—" },
-            { label: "CURRENT VISIT", value: currentVisit ? `Visit ${currentVisit.seq ?? currentVisit.visit_number ?? "—"}` : "—" }, { label: "VISIT DATE", value: fmtScheduleDate(currentVisit?.scheduled_date) },
+            { label: "CURRENT VISIT", value: currentVisit ? visitLabel(currentVisit) : "—" }, { label: "VISIT DATE", value: fmtScheduleDate(currentVisit?.scheduled_date) },
             { label: "VISIT COMPLETED", value: currentVisit?.status === "completed" ? "Yes" : "No" }, { label: "LAST UPDATED", value: currentVisit?.completed_at ? fmtInstantDate(currentVisit.completed_at) : "—" },
           ].map(field => <View key={field.label} style={s.finalField}><Eyebrow color={colors.overlay25} style={s.finalLabel}>{field.label}</Eyebrow><Small color={colors.primaryFg} weight="700" numberOfLines={1} style={s.finalValue}>{field.value}</Small></View>)}</View>
         </LinearGradient>
 
         <Card style={s.finalRemarks}><Eyebrow style={{ marginBottom: 7 }}>REMARKS</Eyebrow><Small color={colors.foreground}>{currentVisit?.note?.trim() || "No remarks recorded yet."}</Small></Card>
 
+        {/* The canonical schedule this patient is actually scheduled from:
+            day-wise activity timing, conditional requirements, confinement
+            episodes and the schedule version they were enrolled under. Shown
+            only once the patient is linked, because before that there is
+            nothing canonical to open. */}
+        {!!patient.uctsm_patient_id && (
+          <Pressable
+            testID="open-canonical-patient-schedule"
+            accessibilityRole="button"
+            accessibilityLabel="Open the protocol schedule for this patient"
+            onPress={() => router.push({
+              pathname: "/(app)/clinical/patient-schedule",
+              params: {
+                patientId: patient.uctsm_patient_id,
+                patientName: patient.subject_id || patient.full_name || "",
+              },
+            })}
+          >
+            <Card style={s.canonicalLink}>
+              <View style={{ flex: 1 }}>
+                <Eyebrow style={{ marginBottom: 4 }}>PROTOCOL SCHEDULE</Eyebrow>
+                <Small color={colors.foreground}>
+                  Activities, conditional requirements, confinement and anchor status
+                </Small>
+              </View>
+              <ChevronDown
+                size={16}
+                color={colors.primary}
+                style={{ transform: [{ rotate: "-90deg" }] }}
+              />
+            </Card>
+          </Pressable>
+        )}
+
         <View>
-          <Pressable onPress={() => setScheduleOpen(open => !open)} style={s.finalScheduleHead}><Eyebrow>VISIT SCHEDULE</Eyebrow><View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}><Small>{visits.length} visits</Small><ChevronDown size={15} color={colors.primary} style={{ transform: [{ rotate: scheduleOpen ? "180deg" : "0deg" }] }} /></View></Pressable>
+          <View style={s.finalScheduleHead}>
+            <Pressable onPress={() => setScheduleOpen(open => !open)} style={s.scheduleHeadToggle}><Eyebrow>VISIT SCHEDULE</Eyebrow><Small>{visits.length} visits</Small><ChevronDown size={15} color={colors.primary} style={{ transform: [{ rotate: scheduleOpen ? "180deg" : "0deg" }] }} /></Pressable>
+            <Pressable testID="add-patient-visit" onPress={openAddSheet} hitSlop={8} style={s.addVisitButton}><Plus size={13} color={colors.primary} /><Small color={colors.primary} weight="700">Add visit</Small></Pressable>
+          </View>
           {scheduleOpen && <View style={s.scheduleTable}>
             <View style={s.scheduleColumns}><Text style={s.scheduleColumnText}>VISIT</Text><Text style={[s.scheduleColumnText, { flex: 1.15 }]}>VISIT NAME</Text><Text style={[s.scheduleColumnText, { flex: 1, textAlign: "right" }]}>WINDOW PERIOD</Text></View>
             {visits.map((visit, index) => {
@@ -315,12 +454,18 @@ export default function ClinicalVisitDetail() {
               const done = visit.status === "completed";
               const overdue = visit.status === "overdue";
               const tasks = [...(visit.clinical_tasks || []), ...(visit.admin_tasks || [])];
-              return <View key={visit.id} style={index ? s.scheduleDivider : undefined}><Pressable onPress={() => setExpandedScheduleVisit(expanded ? null : visit.id)} style={[s.scheduleRow, expanded && s.scheduleRowOpen]}><View style={s.scheduleVisitCell}>{done ? <CheckCircle2 size={14} color={colors.success} /> : overdue ? <Clock3 size={14} color={colors.destructive} /> : <CalIcon size={13} color={colors.mutedFg} />}<Small weight="700">Visit {visit.seq ?? visit.visit_number ?? "—"}</Small></View><View style={{ flex: 1.15 }}><Small numberOfLines={1}>{visit.name || "Visit"}</Small><Small color={colors.mutedFg} numberOfLines={1}>{formatVisitTiming(visit)}</Small></View><View style={s.scheduleWindow}><Small numberOfLines={1}>{windowLabel(visit.scheduled_date)}</Small><ChevronDown size={13} color={colors.mutedFg} style={{ transform: [{ rotate: expanded ? "180deg" : "0deg" }] }} /></View></Pressable>{expanded && <View style={s.activities}><Eyebrow style={{ marginBottom: 6 }}>{done ? "ACTIVITIES COMPLETED" : "PLANNED ACTIVITIES"}</Eyebrow>{tasks.length ? <View style={s.activitiesGrid}>{tasks.map(task => <View key={task.id} style={s.activity}><CheckCircle2 size={12} color={task.completed ? colors.success : colors.mutedFg} /><Small numberOfLines={1}>{task.label}</Small></View>)}</View> : <Small>No activities listed.</Small>}</View>}</View>;
+              const added = !!visit.unscheduled;
+              // No calculable date: the visit is real and still on the
+              // schedule, it just cannot be placed on the calendar yet. It
+              // sorts to the end of the timeline, so the row has to say why
+              // it is down there rather than showing a bare dash.
+              const undated = !visit.scheduled_date;
+              return <View key={visit.id} style={index ? s.scheduleDivider : undefined}><Pressable onPress={() => setExpandedScheduleVisit(expanded ? null : visit.id)} style={[s.scheduleRow, expanded && s.scheduleRowOpen, added && s.scheduleRowAdded]}><View style={s.scheduleVisitCell}>{done ? <CheckCircle2 size={14} color={colors.success} /> : added ? <CalendarPlus size={14} color={colors.primary} /> : overdue ? <Clock3 size={14} color={colors.destructive} /> : <CalIcon size={13} color={colors.mutedFg} />}<Small weight="700" color={added ? colors.primary : undefined}>{visitLabel(visit)}</Small></View><View style={{ flex: 1.15 }}><Small numberOfLines={1}>{visit.name || "Visit"}</Small><Small color={colors.mutedFg} numberOfLines={1}>{added ? (visit.unscheduled_reason || "Added for this patient") : formatVisitTiming(visit)}</Small></View><View style={s.scheduleWindow}><Small numberOfLines={1} color={undated ? colors.warning : undefined}>{undated ? "Date pending" : windowLabel(visit.scheduled_date)}</Small><ChevronDown size={13} color={colors.mutedFg} style={{ transform: [{ rotate: expanded ? "180deg" : "0deg" }] }} /></View></Pressable>{expanded && <View style={s.activities}><Eyebrow style={{ marginBottom: 6 }}>{done ? "ACTIVITIES COMPLETED" : "PLANNED ACTIVITIES"}</Eyebrow>{tasks.length ? <View style={s.activitiesGrid}>{tasks.map(task => <View key={task.id} style={s.activity}><CheckCircle2 size={12} color={task.completed ? colors.success : colors.mutedFg} /><Small numberOfLines={1}>{task.label}</Small></View>)}</View> : <Small>No activities listed.</Small>}{undated && <View testID={`manual-review-${visit.id}`} style={s.manualReview}><Clock3 size={13} color={colors.warning} /><Small color={colors.warning} style={{ flex: 1 }}>{visit.manual_review_reason?.trim() || "This visit has no date yet. Add the date once the protocol timing for it is known."}</Small></View>}{added && <Pressable testID={`remove-visit-${visit.id}`} disabled={removing === visit.id} onPress={() => removeVisit(visit)} style={s.removeVisit}><Trash2 size={13} color={colors.destructive} /><Small color={colors.destructive} weight="700">{removing === visit.id ? "Removing…" : "Remove this visit"}</Small></Pressable>}</View>}</View>;
             })}
           </View>}
         </View>
 
-        <View><View style={s.finalScheduleHead}><Eyebrow>VISIT HISTORY</Eyebrow><Small>{completedVisits.length} completed</Small></View><Card style={s.historyCard}>{completedVisits.length ? <View style={s.historyLine}>{completedVisits.map(visit => <View key={visit.id} style={s.historyItem}><View style={s.historyIcon}><CheckCircle2 size={14} color={colors.success} /></View><View style={{ flex: 1 }}><View style={s.historyTop}><Small weight="700">Visit {visit.seq ?? visit.visit_number ?? "—"}</Small><View style={s.historyDone}><Small color={colors.success} weight="700">Completed</Small></View></View><Small>{visit.name || "Visit"}</Small><Small>{fmtScheduleDate(visit.scheduled_date)}</Small>{visit.note ? <Small style={s.historyNote}>“{visit.note}”</Small> : null}</View></View>)}</View> : <Small>No visits recorded yet.</Small>}</Card></View>
+        <View><View style={s.finalScheduleHead}><Eyebrow>VISIT HISTORY</Eyebrow><Small>{completedVisits.length} completed</Small></View><Card style={s.historyCard}>{completedVisits.length ? <View style={s.historyLine}>{completedVisits.map(visit => <View key={visit.id} style={s.historyItem}><View style={s.historyIcon}><CheckCircle2 size={14} color={colors.success} /></View><View style={{ flex: 1 }}><View style={s.historyTop}><Small weight="700">{visitLabel(visit)}</Small><View style={s.historyDone}><Small color={colors.success} weight="700">Completed</Small></View></View><Small>{visit.name || "Visit"}</Small><Small>{fmtScheduleDate(visit.scheduled_date)}</Small>{visit.note ? <Small style={s.historyNote}>“{visit.note}”</Small> : null}</View></View>)}</View> : <Small>No visits recorded yet.</Small>}</Card></View>
 
         <Button testID="patient-record-update" variant="dawn" disabled={!currentVisit} onPress={() => currentVisit && openSheet(currentVisit)}><Small color={colors.primaryFg} weight="700">Update Visit</Small></Button>
 
@@ -444,7 +589,7 @@ export default function ClinicalVisitDetail() {
           <View style={{ flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between", marginBottom: spacing.md }}>
             <View>
               <H1 style={{ fontSize: 18 }}>Update Visit</H1>
-              <Small>{editing ? `Visit ${editing.seq ?? editing.visit_number ?? ""} · ${editing.name}` : ""}</Small>
+              <Small>{editing ? `${visitLabel(editing)} · ${editing.name}` : ""}</Small>
             </View>
             <Pressable testID="sheet-close" onPress={() => setEditing(null)} hitSlop={10}><X size={20} color={colors.mutedFg} /></Pressable>
           </View>
@@ -478,7 +623,7 @@ export default function ClinicalVisitDetail() {
               ))}
             </View>
 
-            <View style={s.editPair}><View style={{ flex: 1 }}><Small weight="700" style={{ marginBottom: 6 }}>Visit</Small><View style={s.readOnly}><Small weight="700">Visit {editing?.seq ?? editing?.visit_number ?? "—"}</Small></View></View><View style={{ flex: 1 }}><Small weight="700" style={{ marginBottom: 6 }}>Visit Date</Small><TextInput testID="sheet-date" value={form.dateISO} onChangeText={(t) => setForm(f => ({ ...f, dateISO: t }))} placeholder="YYYY-MM-DD" placeholderTextColor={colors.mutedFg} style={s.input} /></View></View>
+            <View style={s.editPair}><View style={{ flex: 1 }}><Small weight="700" style={{ marginBottom: 6 }}>Visit</Small><View style={s.readOnly}><Small weight="700">{editing ? visitLabel(editing) : "—"}</Small></View></View><View style={{ flex: 1 }}><Small weight="700" style={{ marginBottom: 6 }}>Visit Date</Small><TextInput testID="sheet-date" value={form.dateISO} onChangeText={(t) => setForm(f => ({ ...f, dateISO: t }))} placeholder="YYYY-MM-DD" placeholderTextColor={colors.mutedFg} style={s.input} /></View></View>
 
             <View style={s.editPair}><View style={{ flex: 1 }}><Small weight="700" style={{ marginBottom: 6 }}>Visit Name</Small><View style={s.readOnly}><Small numberOfLines={1}>{editing?.name || "Visit"}</Small></View></View><View style={{ flex: 1 }}><Small weight="700" style={{ marginBottom: 6 }}>Visit Type</Small><Pressable testID="visit-type-dropdown" onPress={() => setVisitTypeOpen(true)} style={s.selectBox}><Small>{form.visitType}</Small><ChevronDown size={16} color={colors.foreground} /></Pressable></View></View>
 
@@ -575,6 +720,93 @@ export default function ClinicalVisitDetail() {
           </ScrollView>
         </View>
       </Modal>
+      {/* ── Add Visit bottom sheet ─────────────────────── */}
+      <Modal visible={addOpen} transparent animationType="slide" onRequestClose={() => setAddOpen(false)}>
+        <Pressable style={s.backdrop} onPress={() => (addSaving ? null : setAddOpen(false))} />
+        <View style={s.sheet}>
+          <View style={s.grabber} />
+          <View style={{ flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between", marginBottom: spacing.md }}>
+            <View>
+              <H1 style={{ fontSize: 18 }}>Add Visit</H1>
+              <Small>Added for this patient only · placed by its date</Small>
+            </View>
+            <Pressable testID="add-sheet-close" onPress={() => setAddOpen(false)} hitSlop={10}><X size={20} color={colors.mutedFg} /></Pressable>
+          </View>
+
+          <ScrollView contentContainerStyle={{ gap: spacing.md, paddingBottom: spacing.md }} keyboardShouldPersistTaps="handled">
+            {addError && (
+              <View testID="add-sheet-error" style={s.sheetError}>
+                <Small color={colors.destructive} weight="700">{addError}</Small>
+              </View>
+            )}
+
+            <View>
+              <Small weight="700" style={{ marginBottom: 6 }}>Visit name</Small>
+              <TextInput
+                testID="add-visit-name"
+                value={addForm.name}
+                onChangeText={(t) => setAddForm(f => ({ ...f, name: t }))}
+                placeholder="e.g. Unscheduled safety review"
+                placeholderTextColor={colors.mutedFg}
+                style={s.input}
+              />
+            </View>
+
+            <View style={s.editPair}>
+              <View style={{ flex: 1 }}>
+                <Small weight="700" style={{ marginBottom: 6 }}>Visit date</Small>
+                <TextInput
+                  testID="add-visit-date"
+                  value={addForm.dateISO}
+                  onChangeText={(t) => setAddForm(f => ({ ...f, dateISO: t }))}
+                  placeholder="YYYY-MM-DD"
+                  placeholderTextColor={colors.mutedFg}
+                  style={s.input}
+                />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Small weight="700" style={{ marginBottom: 6 }}>Window (± days)</Small>
+                <TextInput
+                  testID="add-visit-window"
+                  value={addForm.windowDays}
+                  onChangeText={(t) => setAddForm(f => ({ ...f, windowDays: t.replace(/[^0-9]/g, "") }))}
+                  placeholder="0"
+                  placeholderTextColor={colors.mutedFg}
+                  keyboardType="number-pad"
+                  style={s.input}
+                />
+              </View>
+            </View>
+
+            <View>
+              <Small weight="700" style={{ marginBottom: 6 }}>Reason (optional)</Small>
+              <TextInput
+                testID="add-visit-reason"
+                value={addForm.reason}
+                onChangeText={(t) => setAddForm(f => ({ ...f, reason: t }))}
+                placeholder="Why this extra visit was added"
+                placeholderTextColor={colors.mutedFg}
+                multiline
+                style={[s.input, { height: 72, textAlignVertical: "top" }]}
+              />
+            </View>
+
+            <View style={s.addHint}>
+              <CalendarPlus size={14} color={colors.primary} />
+              <Small color={colors.mutedFg} style={{ flex: 1 }}>
+                This visit is added to this patient&apos;s schedule only. It takes its
+                place in the timeline by date — in between the protocol visits it
+                falls between — and the trial&apos;s other patients are unaffected.
+              </Small>
+            </View>
+
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              <Button testID="add-visit-cancel" variant="secondary" style={{ flex: 1 }} onPress={() => setAddOpen(false)}><Small weight="700" color={colors.primary}>Cancel</Small></Button>
+              <Button testID="add-visit-save" variant="dawn" style={{ flex: 1 }} loading={addSaving} onPress={addVisit}><Small weight="700" color={colors.primaryFg}>Add Visit</Small></Button>
+            </View>
+          </ScrollView>
+        </View>
+      </Modal>
       <Modal visible={visitTypeOpen} transparent animationType="fade" onRequestClose={() => setVisitTypeOpen(false)}>
         <Pressable style={s.selectBackdrop} onPress={() => setVisitTypeOpen(false)} />
         <View style={s.selectMenu}>{["Hospital", "Phone", "Remote", "Home"].map(option => <Pressable key={option} testID={`visit-type-${option.toLowerCase()}`} onPress={() => { setForm(current => ({ ...current, visitType: option })); setVisitTypeOpen(false); }} style={[s.selectOption, form.visitType === option && s.selectOptionActive]}><Small color={form.visitType === option ? colors.primaryFg : colors.foreground} weight={form.visitType === option ? "700" : "400"}>{option}</Small></Pressable>)}</View>
@@ -663,8 +895,15 @@ const s = StyleSheet.create({
   finalGrid: { flexDirection: "row", flexWrap: "wrap", rowGap: 11 },
   finalField: { width: "50%", paddingRight: 8 },
   finalLabel: { fontSize: 9 }, finalValue: { marginTop: 3, fontSize: 11 },
+  canonicalLink: { flexDirection: "row", alignItems: "center", gap: 10 },
   finalRemarks: { paddingVertical: 13 },
   finalScheduleHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 7 },
+  scheduleHeadToggle: { flex: 1, flexDirection: "row", alignItems: "center", gap: 8 },
+  addVisitButton: { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999, borderWidth: 1, borderColor: colors.primary, backgroundColor: colors.card },
+  scheduleRowAdded: { backgroundColor: colors.primary + "0D" },
+  removeVisit: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 10, alignSelf: "flex-start", minHeight: 30 },
+  manualReview: { flexDirection: "row", alignItems: "flex-start", gap: 7, marginTop: 10, padding: spacing.sm, borderRadius: radii.md, borderWidth: 1, borderColor: colors.warning + "55", backgroundColor: colors.warning + "12" },
+  addHint: { flexDirection: "row", gap: 8, padding: spacing.sm, borderRadius: radii.md, backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border },
   scheduleTable: { borderWidth: 1, borderColor: colors.border, borderRadius: radii.lg, overflow: "hidden", backgroundColor: colors.card },
   scheduleColumns: { flexDirection: "row", paddingHorizontal: 10, paddingVertical: 8, backgroundColor: colors.surface, borderBottomWidth: 1, borderBottomColor: colors.border },
   scheduleColumnText: { flex: 0.95, color: colors.mutedFg, opacity: 0.75, fontSize: 8, fontWeight: "700", letterSpacing: 0.7 },

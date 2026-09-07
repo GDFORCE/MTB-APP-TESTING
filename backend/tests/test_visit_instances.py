@@ -13,7 +13,7 @@ event loop (Motor pins its io_loop on first use — never asyncio.run here).
 import asyncio
 import sys
 import uuid
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -1122,4 +1122,192 @@ class TestPatientsListEnrichment:
             row = self._row(r.json(), patient['id'])
             assert row['status'] == 'no_visits'
             assert row['next_visit'] is None
+        run(flow())
+
+
+# -- Extra (unscheduled) visits added on the patient profile -----------------
+class TestAddedPatientVisits:
+    """POST /patients/{id}/visits places an extra visit by ITS DATE.
+
+    The site adds a one-off visit (an unplanned safety check, a repeat lab)
+    against a date it already knows. It has to read as an insertion into the
+    middle of the schedule -- between the protocol visits it falls between --
+    not as a new row pinned to either end of the list.
+    """
+
+    @staticmethod
+    def _midpoint(first_iso, second_iso):
+        first = datetime.fromisoformat(first_iso.replace('Z', '+00:00'))
+        second = datetime.fromisoformat(second_iso.replace('Z', '+00:00'))
+        return (first + (second - first) / 2).date().isoformat()
+
+    def test_added_visit_lands_between_its_dated_neighbours(self, pi, trial):
+        trial_doc, _ = trial
+        pi_user, pi_headers = pi
+        async def flow():
+            patient = await _enroll(pi_headers, trial_doc['id'], pi_id=pi_user['id'], days_ago=5)
+            async with make_client() as cli:
+                before = (await cli.get(
+                    f"/api/patients/{patient['id']}/visits", headers=pi_headers)).json()
+                assert [v['name'] for v in before] == ['Screening', 'Baseline', 'Week 2']
+                when = self._midpoint(before[1]['scheduled_date'], before[2]['scheduled_date'])
+                created = await cli.post(
+                    f"/api/patients/{patient['id']}/visits", headers=pi_headers,
+                    json={'name': 'Unscheduled safety review', 'scheduled_date': when,
+                          'window_days': 2, 'reason': 'AE follow-up'})
+                assert created.status_code == 201, created.text
+                assert created.json()['unscheduled'] is True
+                after = (await cli.get(
+                    f"/api/patients/{patient['id']}/visits", headers=pi_headers)).json()
+            # In between -- not first, not last.
+            assert [v['name'] for v in after] == [
+                'Screening', 'Baseline', 'Unscheduled safety review', 'Week 2']
+            # The protocol visits keep the numbers the site knows them by.
+            assert [v['seq'] for v in after if not v.get('unscheduled')] == [1, 2, 3]
+            # ...and the added visit sorts strictly between its neighbours.
+            assert before[1]['seq'] < after[2]['seq'] < before[2]['seq']
+        run(flow())
+
+    def test_added_visit_before_or_after_every_protocol_visit(self, pi, trial):
+        trial_doc, _ = trial
+        pi_user, pi_headers = pi
+        async def flow():
+            patient = await _enroll(pi_headers, trial_doc['id'], pi_id=pi_user['id'], days_ago=5)
+            async with make_client() as cli:
+                before = (await cli.get(
+                    f"/api/patients/{patient['id']}/visits", headers=pi_headers)).json()
+                first = datetime.fromisoformat(
+                    before[0]['scheduled_date'].replace('Z', '+00:00'))
+                last = datetime.fromisoformat(
+                    before[-1]['scheduled_date'].replace('Z', '+00:00'))
+                for name, when in (
+                    ('Early re-consent', (first - timedelta(days=2)).date().isoformat()),
+                    ('Late safety call', (last + timedelta(days=9)).date().isoformat()),
+                ):
+                    r = await cli.post(
+                        f"/api/patients/{patient['id']}/visits", headers=pi_headers,
+                        json={'name': name, 'scheduled_date': when})
+                    assert r.status_code == 201, r.text
+                after = (await cli.get(
+                    f"/api/patients/{patient['id']}/visits", headers=pi_headers)).json()
+            # A date genuinely outside the protocol range still reads by date.
+            assert [v['name'] for v in after] == [
+                'Early re-consent', 'Screening', 'Baseline', 'Week 2', 'Late safety call']
+        run(flow())
+
+    def test_re_dating_a_visit_moves_it_to_where_that_date_falls(self, pi, trial):
+        trial_doc, _ = trial
+        pi_user, pi_headers = pi
+        async def flow():
+            patient = await _enroll(pi_headers, trial_doc['id'], pi_id=pi_user['id'], days_ago=5)
+            async with make_client() as cli:
+                before = (await cli.get(
+                    f"/api/patients/{patient['id']}/visits", headers=pi_headers)).json()
+                pushed = datetime.fromisoformat(
+                    before[2]['scheduled_date'].replace('Z', '+00:00')) + timedelta(days=4)
+                r = await cli.patch(
+                    f"/api/visit-instances/{before[1]['id']}", headers=pi_headers,
+                    json={'scheduled_date': pushed.date().isoformat()})
+                assert r.status_code == 200, r.text
+                after = (await cli.get(
+                    f"/api/patients/{patient['id']}/visits", headers=pi_headers)).json()
+            assert [v['name'] for v in after] == ['Screening', 'Week 2', 'Baseline']
+        run(flow())
+
+    def test_undated_visits_sort_last_not_first(self, pi, trial):
+        trial_doc, _ = trial
+        pi_user, pi_headers = pi
+        async def flow():
+            patient = await _enroll(pi_headers, trial_doc['id'], pi_id=pi_user['id'], days_ago=5)
+            # A visit whose date could not be calculated (manual review).
+            await server.db.visit_instances.update_one(
+                {'patient_id': patient['id'], 'name': 'Screening'},
+                {'$set': {'scheduled_date': None, 'window_start': None,
+                          'window_end': None, 'operational_status': 'manual_review'}})
+            async with make_client() as cli:
+                rows = (await cli.get(
+                    f"/api/patients/{patient['id']}/visits", headers=pi_headers)).json()
+            # Undated visits belong at the end, where they cannot be mistaken
+            # for the next thing due -- never at the top of the schedule.
+            assert [v['name'] for v in rows] == ['Baseline', 'Week 2', 'Screening']
+        run(flow())
+
+    def test_added_visit_rejects_a_bad_date_and_a_missing_patient(self, pi, trial):
+        trial_doc, _ = trial
+        pi_user, pi_headers = pi
+        async def flow():
+            patient = await _enroll(pi_headers, trial_doc['id'], pi_id=pi_user['id'], days_ago=5)
+            async with make_client() as cli:
+                bad = await cli.post(
+                    f"/api/patients/{patient['id']}/visits", headers=pi_headers,
+                    json={'name': 'Nonsense', 'scheduled_date': '31/07/2026'})
+                assert bad.status_code == 400, bad.text
+                missing = await cli.post(
+                    f"/api/patients/nonexistent-{RUN_ID}/visits", headers=pi_headers,
+                    json={'name': 'Ghost',
+                          'scheduled_date': server.now().date().isoformat()})
+                assert missing.status_code == 404, missing.text
+        run(flow())
+
+    def test_added_visit_is_this_patients_only_and_removable(self, pi, trial):
+        trial_doc, _ = trial
+        pi_user, pi_headers = pi
+        async def flow():
+            patient = await _enroll(pi_headers, trial_doc['id'], pi_id=pi_user['id'], days_ago=5)
+            other = await _enroll(pi_headers, trial_doc['id'], pi_id=pi_user['id'], days_ago=5)
+            async with make_client() as cli:
+                created = await cli.post(
+                    f"/api/patients/{patient['id']}/visits", headers=pi_headers,
+                    json={'name': 'Repeat labs',
+                          'scheduled_date': (server.now() + timedelta(days=3)).date().isoformat()})
+                assert created.status_code == 201, created.text
+                added = created.json()
+                # No template was created, so no other patient is affected.
+                assert added['visit_template_id'] is None
+                others = (await cli.get(
+                    f"/api/patients/{other['id']}/visits", headers=pi_headers)).json()
+                assert 'Repeat labs' not in [v['name'] for v in others]
+                # A protocol visit is cancelled through its status, never deleted.
+                protocol = (await cli.get(
+                    f"/api/patients/{patient['id']}/visits", headers=pi_headers)).json()
+                keeper = next(v for v in protocol if not v.get('unscheduled'))
+                blocked = await cli.delete(
+                    f"/api/patients/{patient['id']}/visits/{keeper['id']}", headers=pi_headers)
+                assert blocked.status_code == 409, blocked.text
+                removed = await cli.delete(
+                    f"/api/patients/{patient['id']}/visits/{added['id']}", headers=pi_headers)
+                assert removed.status_code == 200, removed.text
+                left = (await cli.get(
+                    f"/api/patients/{patient['id']}/visits", headers=pi_headers)).json()
+            assert 'Repeat labs' not in [v['name'] for v in left]
+        run(flow())
+
+    def test_an_undated_protocol_visit_carries_a_manual_review_reason(self, sponsor, pi):
+        """An Early Termination / Unscheduled visit has no calculable date.
+
+        The instance is still created -- dateless -- and must say WHY, so the
+        patient profile can show the reason instead of a bare dash on a row
+        that has quietly sorted to the bottom of the timeline.
+        """
+        _, sp_headers = sponsor
+        pi_user, pi_headers = pi
+        async def flow():
+            undated, _ = await _make_trial(sp_headers, templates=((0, 'Screening'),))
+            async with make_client() as cli:
+                rv = await cli.post('/api/visits', headers=sp_headers, json={
+                    'trial_id': undated['id'], 'visit_number': 2,
+                    'name': 'Early Termination', 'day_offset': None,
+                    'source_day_label': 'Unscheduled', 'activities': ['Safety review'],
+                })
+                assert rv.status_code == 200, rv.text
+                patient = await _enroll(pi_headers, undated['id'], pi_id=pi_user['id'], days_ago=5)
+                rows = (await cli.get(
+                    f"/api/patients/{patient['id']}/visits", headers=pi_headers)).json()
+            by_name = {row['name']: row for row in rows}
+            et = by_name['Early Termination']
+            assert et['scheduled_date'] is None
+            assert et['status'] == 'manual_review'
+            assert et['manual_review_reason'].strip(), 'the reason must reach the client'
+            # ...and it sits after the visit that does have a date.
+            assert [row['name'] for row in rows] == ['Screening', 'Early Termination']
         run(flow())

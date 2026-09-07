@@ -48,6 +48,36 @@ class Trial(IdMixin, TimestampMixin, Base):
     drug_name: Mapped[str | None] = mapped_column(Text)
     sponsor_name: Mapped[str | None] = mapped_column(Text)
     metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JsonType, default=dict)
+    external_trial_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    # Where this trial's visit dates are READ from. Defaults to LEGACY, and can
+    # only move to ENGINE through a recorded parity run that matched. Writes stay
+    # on the operational store either way - this switches reads only, so a
+    # disagreement discovered after cutover is reversible without data loss.
+    schedule_read_mode: Mapped[str] = mapped_column(
+        String(16), default="LEGACY", server_default="LEGACY")
+
+
+class ParityRun(IdMixin, Base):
+    """One recorded comparison of the engine against the operational schedule.
+
+    Kept because a cutover is a decision someone made on evidence, and the
+    evidence has to still exist afterwards. A run is tied to the schedule version
+    it compared, so a later amendment invalidates it rather than silently
+    carrying an old approval forward.
+    """
+
+    __tablename__ = "uctsm_parity_runs"
+    organization_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    trial_id: Mapped[UUID] = mapped_column(ForeignKey("uctsm_trials.id", ondelete="CASCADE"), index=True)
+    patient_id: Mapped[UUID | None] = mapped_column(ForeignKey("uctsm_patients.id", ondelete="CASCADE"), index=True)
+    schedule_version_id: Mapped[UUID | None] = mapped_column(ForeignKey("uctsm_schedule_versions.id"))
+    verdict: Mapped[str] = mapped_column(String(32), index=True)
+    compared: Mapped[int] = mapped_column(Integer, default=0)
+    matched: Mapped[int] = mapped_column(Integer, default=0)
+    differences: Mapped[list[Any]] = mapped_column(JsonType, default=list)
+    note: Mapped[str | None] = mapped_column(Text)
+    ran_by: Mapped[UUID | None] = mapped_column(Uuid)
+    ran_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Protocol(IdMixin, TimestampMixin, Base):
@@ -102,6 +132,7 @@ class ScheduleDefinition(IdMixin, TimestampMixin, Base):
     name: Mapped[str] = mapped_column(Text)
     description: Mapped[str | None] = mapped_column(Text)
     schedule_type: Mapped[str] = mapped_column(String(64), default="PRIMARY")
+    external_schedule_definition_id: Mapped[str | None] = mapped_column(String(128), index=True)
 
 
 class ScheduleVersion(IdMixin, TimestampMixin, Base):
@@ -114,11 +145,20 @@ class ScheduleVersion(IdMixin, TimestampMixin, Base):
     extraction_run_id: Mapped[UUID | None] = mapped_column(ForeignKey("uctsm_extraction_runs.id"))
     approved_by: Mapped[UUID | None] = mapped_column(Uuid)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Doc 9 s8. When this version starts applying to NEW enrolments. Approval and
+    # effect are different moments: an amendment approved today may not be in
+    # force until a stated date, and conflating them enrols patients onto a
+    # version that does not yet apply. NULL means "in force once approved".
+    effective_from: Mapped[date | None] = mapped_column(Date, index=True)
     rejection_reason: Mapped[str | None] = mapped_column(Text)
     model_name: Mapped[str | None] = mapped_column(String(128))
     model_version: Mapped[str | None] = mapped_column(String(128))
     schema_version: Mapped[str] = mapped_column(String(32), default="uctsm.v1")
     metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JsonType, default=dict)
+    dimensions: Mapped[list[Any] | None] = mapped_column(JsonType, default=list)
+    conditional_definitions: Mapped[list[Any] | None] = mapped_column(JsonType, default=list)
+    repeat_blocks: Mapped[list[Any] | None] = mapped_column(JsonType, default=list)
+    confinement_episodes: Mapped[list[Any] | None] = mapped_column(JsonType, default=list)
 
 
 class ScheduleChildMixin(IdMixin):
@@ -146,6 +186,10 @@ class DimensionBase(ScheduleChildMixin):
     display_name: Mapped[str] = mapped_column(Text)
     description: Mapped[str | None] = mapped_column(Text)
     criteria: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
+    # Doc 8 s10: "Part A, Cohort 1". Both columns move together - a half-stated
+    # hierarchy behaves as if there were none.
+    parent_dimension_type: Mapped[str | None] = mapped_column(String(32))
+    parent_code: Mapped[str | None] = mapped_column(String(128))
 
 
 class Arm(DimensionBase, Base):
@@ -172,6 +216,7 @@ class Anchor(ScheduleChildMixin, Base):
     anchor_type: Mapped[str] = mapped_column(String(64))
     derivation_rule: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
     source_event_code: Mapped[str | None] = mapped_column(String(128))
+    source_condition_code: Mapped[str | None] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(32), default="RESOLVED")
     evidence_refs: Mapped[list[Any]] = mapped_column(JsonType, default=list)
 
@@ -184,10 +229,20 @@ class Event(ScheduleChildMixin, TimestampMixin, Base):
     display_name: Mapped[str] = mapped_column(Text)
     normalized_name: Mapped[str | None] = mapped_column(Text)
     event_type: Mapped[str] = mapped_column(String(64))
+    # Doc 10 s2-s3, s31-s33. Left null when the protocol does not state a mode:
+    # a default here would send a patient travelling on a guess.
+    visit_mode: Mapped[str | None] = mapped_column(String(64))
+    allowed_visit_modes: Mapped[list[Any] | None] = mapped_column(JsonType, default=list)
+    # Doc 10 s13-s15: ON_DEMAND definitions exist but are never due.
+    activation: Mapped[str] = mapped_column(String(16), default="SCHEDULED", server_default="SCHEDULED")
     epoch_id: Mapped[UUID | None] = mapped_column(ForeignKey("uctsm_epochs.id"))
     sequence_number: Mapped[int | None] = mapped_column(Integer)
     timing: Mapped[dict[str, Any]] = mapped_column(JsonType)
     conditions: Mapped[list[Any]] = mapped_column(JsonType, default=list)
+    dependency_mode: Mapped[str | None] = mapped_column(String(32))
+    conditional_actions: Mapped[list[Any] | None] = mapped_column(JsonType, default=list)
+    qualifiers: Mapped[list[Any] | None] = mapped_column(JsonType, default=list)
+    confinement: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
     metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JsonType, default=dict)
     interpretation_status: Mapped[str] = mapped_column(String(32), default="EXTRACTED")
     requires_review: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -232,6 +287,8 @@ class Activity(IdMixin, Base):
     requiredness: Mapped[str] = mapped_column(String(32), default="REQUIRED")
     timing: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
     conditions: Mapped[list[Any]] = mapped_column(JsonType, default=list)
+    applicability: Mapped[list[Any] | None] = mapped_column(JsonType, default=list)
+    qualifiers: Mapped[list[Any] | None] = mapped_column(JsonType, default=list)
     metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JsonType, default=dict)
     interpretation_status: Mapped[str] = mapped_column(String(32), default="EXTRACTED")
     requires_review: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -312,7 +369,38 @@ class Patient(IdMixin, TimestampMixin, Base):
     arm_id: Mapped[UUID | None] = mapped_column(ForeignKey("uctsm_arms.id"))
     cohort_id: Mapped[UUID | None] = mapped_column(ForeignKey("uctsm_cohorts.id"))
     population_id: Mapped[UUID | None] = mapped_column(ForeignKey("uctsm_populations.id"))
+    dimension_values: Mapped[dict[str, Any] | None] = mapped_column(JsonType, default=dict)
     status: Mapped[str] = mapped_column(String(32), default="ACTIVE")
+    external_patient_id: Mapped[str | None] = mapped_column(String(128), index=True)
+
+
+class PatientScheduleAssignment(IdMixin, Base):
+    __tablename__ = "uctsm_patient_schedule_assignments"
+    patient_id: Mapped[UUID] = mapped_column(ForeignKey("uctsm_patients.id", ondelete="CASCADE"), index=True)
+    schedule_version_id: Mapped[UUID] = mapped_column(ForeignKey("uctsm_schedule_versions.id"), index=True)
+    previous_schedule_version_id: Mapped[UUID | None] = mapped_column(ForeignKey("uctsm_schedule_versions.id"))
+    impact_proposal_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
+    assignment_type: Mapped[str] = mapped_column(String(32), default="ENROLMENT")
+    reason: Mapped[str | None] = mapped_column(Text)
+    assigned_by: Mapped[UUID | None] = mapped_column(Uuid)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class ScheduleImpactProposal(IdMixin, Base):
+    __tablename__ = "uctsm_schedule_impact_proposals"
+    patient_id: Mapped[UUID] = mapped_column(ForeignKey("uctsm_patients.id", ondelete="CASCADE"), index=True)
+    from_schedule_version_id: Mapped[UUID] = mapped_column(ForeignKey("uctsm_schedule_versions.id"), index=True)
+    to_schedule_version_id: Mapped[UUID] = mapped_column(ForeignKey("uctsm_schedule_versions.id"), index=True)
+    horizon: Mapped[date] = mapped_column(Date)
+    input_hash: Mapped[str] = mapped_column(String(64), index=True)
+    impact: Mapped[dict[str, Any]] = mapped_column(JsonType)
+    status: Mapped[str] = mapped_column(String(24), default="PENDING", index=True)
+    reason: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[UUID] = mapped_column(Uuid)
+    confirmed_by: Mapped[UUID | None] = mapped_column(Uuid)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class PatientAnchor(IdMixin, Base):
@@ -384,6 +472,10 @@ class PatientEvent(IdMixin, TimestampMixin, Base):
     schedule_evaluation_id: Mapped[UUID] = mapped_column(ForeignKey("uctsm_schedule_evaluations.id", ondelete="CASCADE"), index=True)
     event_definition_id: Mapped[UUID] = mapped_column(ForeignKey("uctsm_events.id"))
     occurrence_index: Mapped[int] = mapped_column(Integer, default=0)
+    logical_occurrence_id: Mapped[UUID] = mapped_column(Uuid, default=uuid4, index=True)
+    logical_key: Mapped[str] = mapped_column(String(256), index=True)
+    supersedes_patient_event_id: Mapped[UUID | None] = mapped_column(ForeignKey("uctsm_patient_events.id"))
+    protected_history: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(32), index=True)
     nominal_start_date: Mapped[date | None] = mapped_column(Date)
     nominal_end_date: Mapped[date | None] = mapped_column(Date)
@@ -394,6 +486,26 @@ class PatientEvent(IdMixin, TimestampMixin, Base):
     condition_result: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
     dependency_result: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
     generation_reason: Mapped[dict[str, Any]] = mapped_column(JsonType)
+    visit_mode: Mapped[str | None] = mapped_column(String(64))
+    unscheduled_reason: Mapped[str | None] = mapped_column(Text)
+
+
+class PatientUnscheduledVisit(IdMixin, Base):
+    """One unscheduled visit a site created for a patient (doc 10 s14).
+
+    Kept separate from the generated schedule: the patient's own actions are
+    inputs to evaluation, so regenerating a schedule can never erase them.
+    """
+
+    __tablename__ = "uctsm_patient_unscheduled_visits"
+    patient_id: Mapped[UUID] = mapped_column(ForeignKey("uctsm_patients.id", ondelete="CASCADE"), index=True)
+    event_definition_id: Mapped[UUID] = mapped_column(ForeignKey("uctsm_events.id"))
+    event_code: Mapped[str] = mapped_column(String(128))
+    occurred_on: Mapped[date] = mapped_column(Date)
+    reason: Mapped[str] = mapped_column(Text)
+    visit_mode: Mapped[str | None] = mapped_column(String(64))
+    created_by: Mapped[UUID | None] = mapped_column(Uuid)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class PatientEventOccurrence(IdMixin, Base):
@@ -406,6 +518,70 @@ class PatientEventOccurrence(IdMixin, Base):
     recorded_by: Mapped[UUID | None] = mapped_column(Uuid)
     recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JsonType, default=dict)
+
+
+class PatientCondition(IdMixin, Base):
+    """Append-only lifecycle of one protocol condition for one patient.
+
+    A correction or reversal writes a new row and supersedes the previous one, so
+    an incorrectly activated pathway can be undone without erasing the fact that it
+    was activated (requirement doc 2 sections 34-36).
+    """
+
+    __tablename__ = "uctsm_patient_conditions"
+    patient_id: Mapped[UUID] = mapped_column(ForeignKey("uctsm_patients.id", ondelete="CASCADE"), index=True)
+    condition_code: Mapped[str] = mapped_column(String(128), index=True)
+    state: Mapped[str] = mapped_column(String(32), index=True)
+    occurrence_index: Mapped[int] = mapped_column(Integer, default=0)
+    occurrence_date: Mapped[date | None] = mapped_column(Date)
+    resolution_date: Mapped[date | None] = mapped_column(Date)
+    superseded_by_id: Mapped[UUID | None] = mapped_column(Uuid)
+    impact_proposal_id: Mapped[UUID | None] = mapped_column(Uuid)
+    recorded_by: Mapped[UUID | None] = mapped_column(Uuid)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    reason: Mapped[str | None] = mapped_column(Text)
+
+
+class PatientActivity(IdMixin, TimestampMixin, Base):
+    """One protocol activity inside one patient visit occurrence.
+
+    Planned times are recalculated on every evaluation; ``actual_time`` and a
+    NOT_DONE status are execution history and are only written by explicit
+    site data entry, never by re-evaluation.
+    """
+
+    __tablename__ = "uctsm_patient_activities"
+    __table_args__ = (UniqueConstraint("patient_event_id", "activity_definition_id"),)
+    patient_event_id: Mapped[UUID] = mapped_column(ForeignKey("uctsm_patient_events.id", ondelete="CASCADE"), index=True)
+    activity_definition_id: Mapped[UUID] = mapped_column(ForeignKey("uctsm_activities.id"))
+    activity_code: Mapped[str | None] = mapped_column(String(128), index=True)
+    logical_key: Mapped[str] = mapped_column(String(320), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    requiredness: Mapped[str] = mapped_column(String(32))
+    sequence_number: Mapped[int | None] = mapped_column(Integer)
+    planned_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    earliest_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    latest_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    actual_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    timing_resolution: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict)
+    generation_reason: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict)
+
+
+class PatientActivityRecord(IdMixin, Base):
+    """Append-only site record of an intra-day actual time or completion decision."""
+
+    __tablename__ = "uctsm_patient_activity_records"
+    patient_id: Mapped[UUID] = mapped_column(ForeignKey("uctsm_patients.id", ondelete="CASCADE"), index=True)
+    event_code: Mapped[str] = mapped_column(String(128), index=True)
+    occurrence_index: Mapped[int] = mapped_column(Integer, default=0)
+    activity_code: Mapped[str] = mapped_column(String(128), index=True)
+    logical_key: Mapped[str] = mapped_column(String(320), index=True)
+    status: Mapped[str] = mapped_column(String(32))
+    actual_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    superseded_by_id: Mapped[UUID | None] = mapped_column(Uuid)
+    recorded_by: Mapped[UUID | None] = mapped_column(Uuid)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    reason: Mapped[str | None] = mapped_column(Text)
 
 
 class AuditEvent(IdMixin, Base):

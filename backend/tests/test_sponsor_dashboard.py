@@ -73,6 +73,11 @@ def world():
     async def build():
         user_a, headers_a = await register(ORG_A)
         user_b, headers_b = await register(ORG_B)
+        # Registration auto-grants org_admin to whoever FOUNDS a brand-new
+        # organization (server.py ~1443), so user_b — the first member of
+        # ORG_B — is already an admin of it. A genuine non-admin has to be a
+        # second member joining an org that already exists.
+        user_b2, headers_b2 = await register(ORG_B)
         await server.db.users.update_one(
             {"id": user_a["id"]}, {"$set": {"org_admin": True}})
         user_a["org_admin"] = True
@@ -81,6 +86,7 @@ def world():
         return {
             "user_a": user_a, "headers_a": headers_a, "trial_a": trial_a,
             "user_b": user_b, "headers_b": headers_b, "trial_b": trial_b,
+            "user_b2": user_b2, "headers_b2": headers_b2,
         }
     return run(build())
 
@@ -251,9 +257,13 @@ def test_trial_site_is_persistent_and_scoped(world):
             assert foreign.status_code == 403, foreign.text
 
             # A non-admin sponsor cannot mutate even its own trial-site network.
+            # headers_b belongs to ORG_B's founding member, who is an admin by
+            # definition (server.py auto-grants org_admin to whoever creates a
+            # brand-new org) - headers_b2 is a second, later member of the same
+            # org and is the actual non-admin case this assertion needs.
             non_admin = await cli.post(
                 f"/api/sponsor/trials/{world['trial_b']['id']}/sites",
-                headers=world["headers_b"], json=body)
+                headers=world["headers_b2"], json=body)
             assert non_admin.status_code == 403, non_admin.text
     run(flow())
 

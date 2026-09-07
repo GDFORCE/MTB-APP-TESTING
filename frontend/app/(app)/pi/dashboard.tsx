@@ -256,6 +256,9 @@ export default function PiDashboard() {
               testID="qa-new-trial"
             />}
             {(isSmo || loading || dashboard?.capabilities.can_add_patient) && <QA icon={UserPlus} gradient label="Add Patient" onPress={() => router.push("/(app)/clinical/add-patient")} testID="qa-add-patient" />}
+            {/* The schedule engine's action board: confirmations, overdue visits
+                and deviations, bounded so an open-ended protocol cannot flood it. */}
+            <QA icon={ListTodo} bg={C.accent} iconColor="#FFFFFF" label="Needs Attention" onPress={() => router.push("/(app)/clinical/action-board")} testID="qa-action-board" />
           </View>
 
           <Section label="THIS WEEK" action={

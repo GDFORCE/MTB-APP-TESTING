@@ -125,6 +125,10 @@ def world():
                 "id": str(uuid.uuid4()), "patient_id": patient_a["id"],
                 "trial_id": trial_a["id"], "name": "Overdue",
                 "seq": 3, "visit_number": 3, "scheduled_date": start - timedelta(days=1),
+                # The dashboard's overdue count is keyed off window_end, not
+                # scheduled_date (server.py ~8602) — without this the instance
+                # simply never matches the overdue query at all.
+                "window_end": start - timedelta(days=1),
                 "status": "upcoming",
             },
         ]

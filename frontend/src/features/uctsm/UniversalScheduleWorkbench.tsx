@@ -9,9 +9,13 @@ import { Body, Small } from "@/src/components/ui";
 import { colors, radii, shadows, spacing } from "@/src/theme/tokens";
 import {
   decideSchedule, evaluatePatientSchedule, getScheduleProjection, getUniversalSchedule,
-  recordFieldDecision, recordPatientAnchor, recordPatientState, seedDemoWorkspace,
+  confirmScheduleImpact, previewAnchorImpact, recordFieldDecision,
+  previewPatientStateImpact, recordPatientAnchor, seedDemoWorkspace,
   submitScheduleReview, validateSchedule,
 } from "./api";
+import { toImpactRows, summariseImpact } from "./presentation";
+import type { ImpactRow } from "./presentation";
+import { ImpactPreviewTable } from "./ScheduleTable";
 import { ScheduleReviewCard } from "./ScheduleReviewCard";
 import type { Evidence, ScheduleProjection, UniversalSchedule } from "./types";
 
@@ -25,6 +29,9 @@ type PatientResult = {
 
 const errorMessage = (error: any, fallback: string) =>
   error?.response?.data?.detail || error?.message || fallback;
+
+/** What the last impact preview would do, kept so a person can read it. */
+type ImpactRecord = { label: string; rows: ImpactRow[]; summary: string };
 
 export default function UniversalScheduleWorkbench() {
   const router = useRouter();
@@ -126,17 +133,43 @@ export default function UniversalScheduleWorkbench() {
     const lastDoseAnchor = schedule.anchors.find((item) => item.code === "LAST_DOSE");
     const progressionAnchor = schedule.anchors.find((item) => item.code === "PROGRESSION");
     if (!lastDoseAnchor) throw new Error("The test schedule has no LAST_DOSE anchor.");
-    await recordPatientAnchor(patientId, lastDoseAnchor.id, lastDose);
+    const previews: ImpactRecord[] = [];
+    const confirmAnchor = async (anchorId: string, value: string, label: string) => {
+      const candidate = await recordPatientAnchor(patientId, anchorId, value);
+      const preview = await previewAnchorImpact(
+        patientId, candidate.id, "2028-12-31", `Confirm ${label} anchor`,
+      );
+      // Recorded BEFORE confirming, so the workbench shows what was agreed to
+      // rather than only that something was agreed to (UI spec s4.5).
+      const rows = toImpactRows(preview.impact?.events);
+      previews.push({ label: `${label} anchor`, rows, summary: summariseImpact(rows) });
+      await confirmScheduleImpact(preview.id, `Confirmed ${label} after impact preview`);
+    };
+    await confirmAnchor(lastDoseAnchor.id, lastDose, "Last Dose");
     if (progression) {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(progression)) throw new Error("Enter Progression as YYYY-MM-DD or leave it blank.");
       if (!progressionAnchor) throw new Error("The test schedule has no PROGRESSION anchor.");
-      await recordPatientAnchor(patientId, progressionAnchor.id, progression);
-      await recordPatientState(patientId, "progression", true);
+      await confirmAnchor(progressionAnchor.id, progression, "Progression");
+      const statePreview = await previewPatientStateImpact(
+        patientId, "progression", true, "2028-12-31", "Confirm progression state",
+      );
+      const stateRows = toImpactRows(statePreview.impact?.events);
+      previews.push({
+        label: "Disease progression",
+        rows: stateRows,
+        summary: summariseImpact(stateRows),
+      });
+      await confirmScheduleImpact(
+        statePreview.id, "Confirmed progression state after impact preview",
+      );
     }
     const result = await evaluatePatientSchedule(patientId, "2028-12-31", `uctsm-ui-${Date.now()}`);
+    setImpacts(previews);
     setPatientResult(result as PatientResult);
     setNotice("Patient schedule evaluated deterministically and saved as a new evaluation.");
   });
+
+  const [impacts, setImpacts] = useState<ImpactRecord[]>([]);
 
   const openEvidence = (item: Evidence) => Alert.alert(
     `Protocol evidence · Page ${item.page_number || "?"}`,
@@ -228,6 +261,16 @@ export default function UniversalScheduleWorkbench() {
                 <ActionButton label="Evaluate patient schedule" loading={busy === "evaluate"} icon={<RefreshCw size={17} color={colors.white} />} onPress={evaluate} />
               </View>
             )}
+
+            {/* UI spec s4.5. What each confirmation actually agreed to. An impact
+                preview nobody reads is a confirmation dialog with extra steps. */}
+            {impacts.map((item) => (
+              <View key={item.label} style={styles.resultsCard}>
+                <Body weight="700">{item.label} · impact preview</Body>
+                <Small style={{ marginTop: 3 }}>{item.summary}</Small>
+                <ImpactPreviewTable rows={item.rows} />
+              </View>
+            ))}
 
             {!!patientResult && (
               <View style={styles.resultsCard}>

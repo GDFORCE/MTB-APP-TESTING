@@ -11,8 +11,10 @@ from app.db.base import Base
 from app.db import models as db
 from app.db.repositories import ScheduleRepository
 from app.domain.schedule.models import (
-    Anchor, ClaimEvidence, Event, Evidence, ScheduleMetadata, UniversalSchedule,
+    Activity, Anchor, ClaimEvidence, ConditionalAction, ConfinementDefinition,
+    DependencyMode, Event, Evidence, Qualifier, ScheduleMetadata, UniversalSchedule,
 )
+from app.domain.schedule.condition import ComparisonCondition, FieldOperand, LiteralOperand
 from app.domain.schedule.timing import AnchorReference, OffsetTiming, TemporalAmount
 
 
@@ -38,6 +40,32 @@ def test_relational_schedule_round_trip_uses_typed_json_contracts():
             code="DAY_30", protocol_label="Day 30", display_name="Day 30", event_type="VISIT",
             timing=OffsetTiming(reference=AnchorReference(code="BASELINE"), offset=TemporalAmount(value=30, unit="DAY")),
             evidence_refs=[evidence.id],
+            dependency_mode=DependencyMode.NOMINAL,
+            qualifiers=[Qualifier(
+                marker="a", text="Perform only when clinically indicated", scope="VISIT",
+                category="CONDITION", target_codes=["DAY_30"], resolved=True,
+                evidence_refs=[evidence.id],
+            )],
+            conditional_actions=[ConditionalAction(
+                action_type="MANUAL_REVIEW", target_code="DAY_30",
+                condition=ComparisonCondition(
+                    operator="EQUALS", left=FieldOperand(field="patient.symptomatic"),
+                    right=LiteralOperand(value=True),
+                ),
+                evidence_refs=[evidence.id],
+            )],
+            confinement=ConfinementDefinition(
+                admission_event_code="ADMIT", dose_event_codes=["DOSE"],
+                discharge_event_code="DISCHARGE", evidence_refs=[evidence.id],
+            ),
+            activities=[Activity(
+                protocol_label="ECG", display_name="ECG", activity_type="ASSESSMENT",
+                qualifiers=[Qualifier(
+                    marker="b", text="Arm A only", scope="ACTIVITY",
+                    category="APPLICABILITY", target_codes=["ECG"], resolved=True,
+                    evidence_refs=[evidence.id],
+                )],
+            )],
         )
         schedule = UniversalSchedule(
             schedule_metadata=ScheduleMetadata(name="Primary", protocol_version_id=protocol_version_id),

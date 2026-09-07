@@ -5,6 +5,10 @@ import { useLocalSearchParams, useRouter } from "expo-router";
 import * as Clipboard from "expo-clipboard";
 import { ChevronLeft, ChevronRight, Calendar as CalIcon, Sparkles, AlertTriangle, RefreshCw, Users, UserRound, Phone as PhoneIcon, ClipboardList } from "lucide-react-native";
 import { api } from "@/src/api/client";
+import {
+  EMPTY_ASSIGNMENT, ProtocolAssignmentFields,
+} from "@/src/features/uctsm/ProtocolAssignmentFields";
+import type { ProtocolAssignment } from "@/src/features/uctsm/ProtocolAssignmentFields";
 import { useAuth } from "@/src/auth/AuthContext";
 import { formatIsoCalendarDate } from "@/src/lib/visit-timing";
 import { sanitizeName } from "@/src/lib/validators";
@@ -104,6 +108,10 @@ export default function AddPatient() {
   const [arms, setArms] = useState<string[]>([]);
   const [armLabel, setArmLabel] = useState<string | null>(null);
   const [armOpen, setArmOpen] = useState(false);
+  // The groupings the APPROVED canonical schedule defines for this protocol.
+  // Empty for a trial with no canonical schedule, which then keeps the
+  // operational arm/substudy pickers below exactly as they were.
+  const [assignment, setAssignment] = useState<ProtocolAssignment>(EMPTY_ASSIGNMENT);
   const [baseline, setBaseline] = useState("5 May 2025");
   const [scheduleGenerated, setScheduleGenerated] = useState(false);
   const [scheduleVisits, setScheduleVisits] = useState<ScheduleVisit[]>([]);
@@ -211,6 +219,25 @@ export default function AddPatient() {
     return () => { alive = false; };
   }, [trialId]);
 
+  // When the trial has an approved canonical schedule, that schedule is the
+  // source of truth for which protocol groupings exist. The operational
+  // arm/substudy pickers below stay for trials that do not have one yet, so a
+  // trial mid-cutover keeps working either way.
+  const canonicalDimensions = new Set(assignment.dimensionTypes);
+  const effectiveArmLabel = canonicalDimensions.has("ARM")
+    ? (assignment.labels.ARM || null)
+    : armLabel;
+  const effectiveSubstudyLabel = canonicalDimensions.has("SUBSTUDY")
+    ? (assignment.labels.SUBSTUDY || null)
+    : substudyLabel;
+  // ARM, COHORT and POPULATION have their own columns on the patient record;
+  // every other grouping the protocol defines travels by name.
+  const dimensionValues = Object.fromEntries(
+    Object.entries(assignment.values)
+      .filter(([key]) => !["ARM", "COHORT", "POPULATION"].includes(key))
+      .map(([key, value]) => [key, [value]]),
+  );
+
   const selectedTrial = trials.find(t => t.id === trialId);
   const selectedPi = pis.find(pi => pi.id === piId);
   const suggestedInitials = initialsFromName(fullName);
@@ -227,8 +254,9 @@ export default function AddPatient() {
     && scheduleGenerated
     && scheduleVisits.length > 0
     && (!needsPiSelection || !!piId)
-    && (substudies.length <= 1 || !!substudyLabel)
-    && (arms.length <= 1 || !!armLabel)
+    && (canonicalDimensions.has("SUBSTUDY") || substudies.length <= 1 || !!substudyLabel)
+    && (canonicalDimensions.has("ARM") || arms.length <= 1 || !!armLabel)
+    && assignment.complete
     && !subjectDuplicate
     && !emailDuplicate
     && !saving;
@@ -240,9 +268,11 @@ export default function AddPatient() {
         ? "Select a trial to continue"
         : needsPiSelection && !piId
           ? "Select the responsible PI"
-          : substudies.length > 1 && !substudyLabel
+          : !assignment.complete
+            ? "Select the protocol group this patient is enrolled under"
+            : substudies.length > 1 && !substudyLabel && !canonicalDimensions.has("SUBSTUDY")
             ? "Select which substudy this patient is enrolled in"
-            : arms.length > 1 && !armLabel
+            : arms.length > 1 && !armLabel && !canonicalDimensions.has("ARM")
               ? "Select which arm this patient is enrolled in"
               : !scheduleGenerated || !scheduleVisits.length
                 ? "Generate the visit schedule to continue"
@@ -297,8 +327,8 @@ export default function AddPatient() {
     try {
       const response = await api.post(`/trials/${trialId}/schedule-preview`, {
         baseline_date: toISO(parsedBaseline),
-        substudy_label: substudyLabel || undefined,
-        arm_label: armLabel || undefined,
+        substudy_label: effectiveSubstudyLabel || undefined,
+        arm_label: effectiveArmLabel || undefined,
       });
       setScheduleVisits(response.data?.visits || []);
       setScheduleGenerated(true);
@@ -326,8 +356,10 @@ export default function AddPatient() {
         phone: `+91${phoneDigits}`,
         trial_id: trialId,                                  // the SELECTED trial
         pi_id: needsPiSelection ? piId : undefined,
-        substudy_label: substudyLabel || undefined,
-        arm_label: armLabel || undefined,
+        substudy_label: effectiveSubstudyLabel || undefined,
+        arm_label: effectiveArmLabel || undefined,
+        cohort_label: assignment.labels.COHORT || undefined,
+        dimension_values: Object.keys(dimensionValues).length ? dimensionValues : undefined,
         subject_id: subjectId ? `SUBJ-${subjectId}` : undefined,
         dob: parsedDob ? toISO(parsedDob) : (dob || undefined),
         gender: gender || undefined,
@@ -576,7 +608,22 @@ export default function AddPatient() {
             </Field>
           )}
 
-          {substudies.length > 1 && (
+          {/* Screen B: only the groupings THIS protocol defines, taken from the
+              approved canonical schedule the patient will be enrolled onto. */}
+          <ProtocolAssignmentFields
+            trialId={trialId}
+            onChange={(next) => {
+              setAssignment(next);
+              if (JSON.stringify(next.values) !== JSON.stringify(assignment.values)) {
+                // A schedule previewed under a different assignment no longer
+                // reflects what will be sent, so it has to be regenerated.
+                setScheduleGenerated(false);
+                setScheduleVisits([]);
+              }
+            }}
+          />
+
+          {substudies.length > 1 && !canonicalDimensions.has("SUBSTUDY") && (
             <Field label="Substudy *" hint="This protocol has more than one Schedule of Assessments — pick the one this patient is enrolled under." active={substudyOpen}>
               <Pressable testID="substudy-toggle" onPress={() => setSubstudyOpen(open => !open)} style={[s.input, s.selectControl]}>
                 <Text numberOfLines={1} style={[s.selectText, !substudyLabel && s.placeholderText]}>
@@ -609,7 +656,7 @@ export default function AddPatient() {
             </Field>
           )}
 
-          {arms.length > 1 && (
+          {arms.length > 1 && !canonicalDimensions.has("ARM") && (
             <Field label="Arm *" hint="This trial has arm-specific visit templates — pick the arm this patient is enrolled under." active={armOpen}>
               <Pressable testID="arm-toggle" onPress={() => setArmOpen(open => !open)} style={[s.input, s.selectControl]}>
                 <Text numberOfLines={1} style={[s.selectText, !armLabel && s.placeholderText]}>

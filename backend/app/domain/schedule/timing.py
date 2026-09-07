@@ -8,7 +8,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # populate_by_name lets a model be re-read from its own model_dump(). Without
+    # it an aliased field (RecurrenceTermination.termination_date, alias "date")
+    # serialises under one name and is rejected under the other, so a recurrence
+    # that ends on a fixed date could not survive being stored and loaded back.
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
 class TimeUnit(StrEnum):
@@ -52,8 +56,21 @@ class EventReference(StrictModel):
     occurrence: Literal["FIRST", "LAST", "CURRENT"] = "CURRENT"
 
 
+class ActivityReference(StrictModel):
+    """An intra-day anchor: another activity inside the same visit occurrence.
+
+    Protocols say "2 hours after dosing" or "2 hours after completion of infusion".
+    The referenced activity's ACTUAL recorded time is the anchor; a planned time is
+    never substituted, so dependent activities stay unresolved until it is recorded.
+    """
+
+    kind: Literal["ACTIVITY"] = "ACTIVITY"
+    activity_code: str = Field(min_length=1)
+
+
 TemporalReference = Annotated[
-    Union[AnchorReference, EventReference], Field(discriminator="kind")
+    Union[AnchorReference, EventReference, ActivityReference],
+    Field(discriminator="kind"),
 ]
 
 

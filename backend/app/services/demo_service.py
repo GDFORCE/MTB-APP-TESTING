@@ -14,7 +14,8 @@ from app.domain.schedule.models import (
 )
 from app.domain.schedule.timing import (
     AnchorReference, NominalWindowTiming, NonNegativeTemporalAmount,
-    OffsetTiming, PositiveTemporalAmount, TemporalAmount, TriggeredTiming,
+    OffsetTiming, PositiveTemporalAmount, ProtocolDefinedTiming, TemporalAmount,
+    TriggeredTiming,
     TriggerWithin, Window,
 )
 
@@ -115,8 +116,17 @@ class DemoService:
             )],
             evidence_refs=[evidence.id],
         )
+        # Doc 10 s13-s15. Every real protocol has one of these, and it is the
+        # case most likely to be mishandled, so the demo carries it.
+        unscheduled = Event(
+            code="UNSCHEDULED_VISIT", protocol_label="Unscheduled Visit",
+            display_name="Unscheduled Visit", event_type="UNSCHEDULED",
+            activation="ON_DEMAND", allowed_visit_modes=["CLINIC", "TELEPHONE"],
+            timing=ProtocolDefinedTiming(handler="on-demand"),
+            evidence_refs=[evidence.id],
+        )
         claims = []
-        for event in (safety, progression):
+        for event in (safety, progression, unscheduled):
             claims.extend([
                 ClaimEvidence(
                     evidence_id=evidence.id, claim_type="EVENT_NAME",
@@ -140,7 +150,7 @@ class DemoService:
                 protocol_version_id=protocol_version.id,
                 status=ScheduleStatus.VALIDATION_REQUIRED,
             ),
-            anchors=[last_dose, progression_anchor], events=[safety, progression],
+            anchors=[last_dose, progression_anchor], events=[safety, progression, unscheduled],
             evidence=[evidence], claim_evidence=claims,
         )
         ScheduleRepository(self.session).persist_draft(

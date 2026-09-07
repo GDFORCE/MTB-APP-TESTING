@@ -408,6 +408,67 @@ def test_structural_issues_flags_recurrence_generated_occurrence_names():
     assert any("recurrence" in issue for issue in issues)
 
 
+def _recurrence_plan(*, source_label: str, value: float, unit: str, value_max=None):
+    return CanonicalSchedulePlan(
+        anchors=[ScheduleAnchor(id="anchor-bl", name="Baseline", anchor_type="first_dose")],
+        events=[ScheduleEvent(
+            id="event-bma", name="Bone Marrow Aspirate", event_type="assessment",
+            timing=TimingExpression(
+                kind="offset", anchor_id="anchor-bl",
+                offset=TemporalAmount(value=0, unit="day"), source_label="Day 1"),
+        )],
+        recurrences=[RecurrenceRule(
+            id="rec-bma", event_ids=["event-bma"],
+            frequency=TemporalAmount(value=value, unit=unit, value_max=value_max),
+            start_occurrence=1, end_occurrence=3, source_label=source_label,
+        )],
+    )
+
+
+def test_structural_issues_flags_a_range_cadence_collapsed_to_one_number():
+    """Real protocol text (NCT00129740 s7.3): 'Bone marrow aspirate with
+    cytogenetics or FISH every 3-4 months in year 1'. Recording only
+    frequency.value=3 with no value_max silently drops the stated 4-month
+    upper bound - exactly the gap the user's own review caught."""
+    schedule = ExtractedSchedule.model_validate({
+        "schedule_kind": "linear",
+        "canonical_plan": _recurrence_plan(
+            source_label="every 3-4 months", value=3, unit="month").model_dump(),
+    })
+
+    issues = _structural_issues(schedule)
+
+    assert any(
+        "range cadence" in issue and "3-4 month" in issue and "value_max" in issue
+        for issue in issues
+    )
+
+
+def test_structural_issues_does_not_flag_a_range_cadence_once_value_max_is_set():
+    schedule = ExtractedSchedule.model_validate({
+        "schedule_kind": "linear",
+        "canonical_plan": _recurrence_plan(
+            source_label="every 3-4 months", value=3, unit="month", value_max=4,
+        ).model_dump(),
+    })
+
+    issues = _structural_issues(schedule)
+
+    assert not any("range cadence" in issue for issue in issues)
+
+
+def test_structural_issues_does_not_flag_a_single_fixed_cadence():
+    schedule = ExtractedSchedule.model_validate({
+        "schedule_kind": "linear",
+        "canonical_plan": _recurrence_plan(
+            source_label="every 3 months", value=3, unit="month").model_dump(),
+    })
+
+    issues = _structural_issues(schedule)
+
+    assert not any("range cadence" in issue for issue in issues)
+
+
 def test_structural_issues_flags_unclassified_visit_type():
     """A visit left at the generic default event_type 'visit' is a real miss.
 

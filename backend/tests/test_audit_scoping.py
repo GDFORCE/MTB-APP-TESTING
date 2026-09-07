@@ -90,6 +90,22 @@ async def _make_trial(sponsor_headers, sponsor_name):
     return trial
 
 
+async def _accept_trial_invitation(user, trial_id):
+    """Give a PI/CRC the real bridging tie _can_access_trial checks for a staff
+    member who is neither the trial's creator nor its sponsor-org: an accepted
+    invitation (see server.py _has_accepted_trial_invitation). Site PI/CRC
+    orgs are deliberately distinct strings from the trial's sponsor org in
+    this file (that separation is what the site-vs-sponsor scoping assertions
+    below depend on), so without this a PI has no path to enroll their very
+    first patient into a trial they did not create."""
+    await server.db.invitations.insert_one({
+        'id': str(uuid.uuid4()), 'token': uuid.uuid4().hex,
+        'email': user['email'], 'phone': '', 'role': user['role'],
+        'trial_id': trial_id, 'status': 'accepted',
+        'created_at': server.now(),
+    })
+
+
 async def _enroll(staff_headers, trial_id, full_name, pi_id=None, crc_id=None):
     enrolled = (server.now() - timedelta(days=5)).date().isoformat()
     async with make_client() as cli:
@@ -135,6 +151,7 @@ def _cleanup():
         await db.organizations.delete_many({'name': {'$regex': RUN_ID}})
         await db.trials.delete_many({'id': {'$in': _trial_ids}})
         await db.visits.delete_many({'trial_id': {'$in': _trial_ids}})
+        await db.invitations.delete_many({'trial_id': {'$in': _trial_ids}})
         await db.patients.delete_many({'email': {'$regex': f'audit-{RUN_ID}-'}})
         await db.visit_instances.delete_many({'trial_id': {'$in': _trial_ids}})
         await db.notifications.delete_many({'trial_id': {'$in': _trial_ids}})
@@ -160,6 +177,9 @@ def world():
 
         trial_a = await _make_trial(sp_a_h, ORG_SPONSOR_A)
         trial_b = await _make_trial(sp_b_h, ORG_SPONSOR_B)
+
+        await _accept_trial_invitation(pi_a, trial_a['id'])
+        await _accept_trial_invitation(pi_b, trial_b['id'])
 
         patient_a = await _enroll(pi_a_h, trial_a['id'], NAME_A,
                                   pi_id=pi_a['id'], crc_id=crc_a['id'])
