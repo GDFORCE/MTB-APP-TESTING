@@ -14,9 +14,9 @@ from app.domain.schedule.condition import (
 from app.domain.schedule.evaluator import ScheduleEvaluator, add_amount, evaluate_timing
 from app.domain.schedule.exceptions import ScheduleNotApprovedError
 from app.domain.schedule.models import (
-    Anchor, ClaimEvidence, Dependency, Event, Evidence, PatientContext,
+    Anchor, ApplicabilityRule, ClaimEvidence, Dependency, Event, Evidence, PatientContext,
     PatientEventStatus, RecurrenceRule, RecurrenceTermination,
-    ScheduleMetadata, ScheduleStatus, UniversalSchedule,
+    ScheduleMetadata, ScheduleStatus, StudyDimension, UniversalSchedule,
 )
 from app.domain.schedule.timing import (
     AnchorReference, EventReference, NominalWindowTiming, NonNegativeTemporalAmount,
@@ -221,6 +221,179 @@ def test_dependency_cycle_is_blocking():
     schedule = schedule_with(a, status=ScheduleStatus.DRAFT)
     schedule.events.append(b)
     assert any(item.issue_code == "CIRCULAR_DEPENDENCY" for item in ScheduleValidator().validate(schedule))
+
+
+def test_interleaved_independent_recurrences_already_work_with_no_new_schema():
+    """Confirms "interleaved recurrence" (two overlapping regimens on
+    independent rhythms) is already fully handled: recurrence is a per-event
+    property, expanded independently by the evaluator. This is a correctly
+    extracted-document question, not a scheduling-engine gap -- if a real
+    protocol fails here, the fix is in extraction/prompting, not new code."""
+    drug_a = Event(
+        code="DRUG_A", protocol_label="Drug A dose", display_name="Drug A dose", event_type="VISIT",
+        timing=OffsetTiming(reference=AnchorReference(code="BASELINE"), offset=TemporalAmount(value=0, unit="DAY")),
+        recurrence=RecurrenceRule(
+            interval=PositiveTemporalAmount(value=14, unit="DAY"),
+            start_reference=AnchorReference(code="BASELINE"),
+            termination=RecurrenceTermination(type="COUNT", count=3),
+        ),
+    )
+    drug_b = Event(
+        code="DRUG_B", protocol_label="Drug B dose", display_name="Drug B dose", event_type="VISIT",
+        timing=OffsetTiming(reference=AnchorReference(code="BASELINE"), offset=TemporalAmount(value=0, unit="DAY")),
+        recurrence=RecurrenceRule(
+            interval=PositiveTemporalAmount(value=21, unit="DAY"),
+            start_reference=AnchorReference(code="BASELINE"),
+            termination=RecurrenceTermination(type="COUNT", count=2),
+        ),
+    )
+    schedule = schedule_with(drug_a)
+    schedule.events.append(drug_b)
+    evidence_id = schedule.evidence[0].id
+    drug_b.evidence_refs = [evidence_id]
+    schedule.claim_evidence += [
+        ClaimEvidence(evidence_id=evidence_id, claim_type="EVENT_NAME", claim_entity_type="EVENT",
+                      claim_entity_id=drug_b.id, claim_path="display_name"),
+        ClaimEvidence(evidence_id=evidence_id, claim_type="TIMING", claim_entity_type="EVENT",
+                      claim_entity_id=drug_b.id, claim_path="timing"),
+        ClaimEvidence(evidence_id=evidence_id, claim_type="RECURRENCE", claim_entity_type="EVENT",
+                      claim_entity_id=drug_b.id, claim_path="recurrence"),
+    ]
+    results = ScheduleEvaluator().evaluate(schedule, context(schedule), horizon=date(2026, 4, 1)).events
+    drug_a_dates = sorted(item.timing.nominal_start for item in results if item.event_code == "DRUG_A")
+    drug_b_dates = sorted(item.timing.nominal_start for item in results if item.event_code == "DRUG_B")
+    assert drug_a_dates == [date(2026, 1, 1), date(2026, 1, 15), date(2026, 1, 29)]
+    assert drug_b_dates == [date(2026, 1, 1), date(2026, 1, 22)]
+    # The two independent series genuinely interleave on the calendar, not
+    # merged, not collapsed, not requiring the other's cadence to divide evenly.
+    all_dates = sorted(item.timing.nominal_start for item in results)
+    assert all_dates == [date(2026, 1, 1), date(2026, 1, 1), date(2026, 1, 15), date(2026, 1, 22), date(2026, 1, 29)]
+
+
+def test_regimen_switch_by_patient_state_already_works_with_no_new_schema():
+    """Confirms "regimen/template selection" is already fully handled via
+    ApplicabilityRule's existing PATIENT_ATTRIBUTE dimension: an event can be
+    scoped to apply only once a recorded clinical fact (e.g. achieving CR)
+    sets a state field -- no new applicability dimension or handler needed.
+    If a real protocol's regimen switch isn't extracted this way, the fix is
+    in extraction/prompting, not the schema."""
+    maintenance_dose = Event(
+        code="MAINTENANCE_DOSE", protocol_label="Maintenance regimen dose",
+        display_name="Maintenance regimen dose", event_type="VISIT",
+        timing=OffsetTiming(reference=AnchorReference(code="BASELINE"), offset=TemporalAmount(value=30, unit="DAY")),
+        applicability=[ApplicabilityRule(
+            dimension="PATIENT_ATTRIBUTE", field="regimen_code", values=["MAINTENANCE"],
+        )],
+    )
+    schedule = schedule_with(maintenance_dose)
+
+    still_induction = context(schedule, state={"regimen_code": "INDUCTION"})
+    result = ScheduleEvaluator().evaluate(schedule, still_induction, horizon=date(2026, 3, 1)).events[0]
+    assert result.applicability_result == "FALSE"
+
+    switched_to_maintenance = context(schedule, state={"regimen_code": "MAINTENANCE"})
+    result = ScheduleEvaluator().evaluate(schedule, switched_to_maintenance, horizon=date(2026, 3, 1)).events[0]
+    assert result.applicability_result == "TRUE"
+    assert result.timing.nominal_start == date(2026, 1, 31)
+
+
+def test_asymmetric_calendar_windows_already_work_with_no_new_schema():
+    """Confirms "asymmetric/special calendar window" is already fully
+    handled: Window.before and Window.after are independent values, not
+    forced symmetric. If a real protocol's asymmetric window (e.g. -2/+7
+    days) isn't extracted this way, the fix is in extraction, not the schema."""
+    event = Event(
+        code="FOLLOW_UP", protocol_label="Follow-up", display_name="Follow-up", event_type="VISIT",
+        timing=NominalWindowTiming(
+            nominal=OffsetTiming(reference=AnchorReference(code="BASELINE"), offset=TemporalAmount(value=30, unit="DAY")),
+            window=Window(
+                before=NonNegativeTemporalAmount(value=2, unit="DAY"),
+                after=NonNegativeTemporalAmount(value=7, unit="DAY"),
+            ),
+        ),
+    )
+    schedule = schedule_with(event)
+    result = ScheduleEvaluator().evaluate(schedule, context(schedule), horizon=date(2026, 3, 1)).events[0]
+    assert result.timing.nominal_start == date(2026, 1, 31)
+    assert result.timing.earliest == date(2026, 1, 29)  # -2 days
+    assert result.timing.latest == date(2026, 2, 7)      # +7 days, genuinely asymmetric
+
+
+def test_time_of_day_inheritance_already_works_with_no_new_schema():
+    """Confirms "time-of-day inheritance" (e.g. PK samples at the exact
+    clock time of the dosing anchor) is already fully handled: anchors may
+    carry a full datetime, and HOUR/MINUTE offset units compose on top of it
+    with ordinary calendar arithmetic -- no separate time-of-day concept
+    needed. If a real protocol's PK time-of-day rule isn't extracted this
+    way, the fix is in extraction, not the schema."""
+    pk_anchor_time = Event(
+        code="PK_2H", protocol_label="PK sample at 2h post-dose", display_name="PK sample at 2h post-dose",
+        event_type="PROCEDURE",
+        timing=OffsetTiming(reference=AnchorReference(code="BASELINE"), offset=TemporalAmount(value=2, unit="HOUR")),
+    )
+    schedule = schedule_with(pk_anchor_time)
+    dosed_at = context(schedule, anchors={"BASELINE": datetime(2026, 1, 1, 9, 30, tzinfo=timezone.utc)})
+    result = ScheduleEvaluator().evaluate(schedule, dosed_at, horizon=date(2026, 3, 1)).events[0]
+    assert result.timing.nominal_start == datetime(2026, 1, 1, 11, 30, tzinfo=timezone.utc)
+
+
+def test_lab_result_gated_scheduling_already_works_with_no_new_schema():
+    """Confirms "lab/result-gated scheduling" (e.g. repeat only if ANC <
+    1000) is already fully handled: event.conditions already evaluates
+    arbitrary ComparisonCondition expressions against PatientContext.state
+    with Kleene three-valued logic -- an unknown lab value is UNKNOWN, never
+    treated as false. If a real protocol's lab-gated rule isn't extracted
+    this way, the fix is in extraction, not the schema."""
+    repeat_if_low_anc = Event(
+        code="REPEAT_CBC", protocol_label="Repeat CBC if ANC low", display_name="Repeat CBC if ANC low",
+        event_type="PROCEDURE",
+        timing=OffsetTiming(reference=AnchorReference(code="BASELINE"), offset=TemporalAmount(value=7, unit="DAY")),
+        conditions=[ComparisonCondition(
+            operator="LT", left=FieldOperand(field="ANC"), right=LiteralOperand(value=1000),
+        )],
+    )
+    schedule = schedule_with(repeat_if_low_anc)
+
+    unknown_anc = context(schedule, state={})
+    result = ScheduleEvaluator().evaluate(schedule, unknown_anc, horizon=date(2026, 3, 1)).events[0]
+    assert result.condition_result == "UNKNOWN"
+
+    normal_anc = context(schedule, state={"ANC": 1500})
+    result = ScheduleEvaluator().evaluate(schedule, normal_anc, horizon=date(2026, 3, 1)).events[0]
+    assert result.condition_result == "FALSE"
+
+    low_anc = context(schedule, state={"ANC": 800})
+    result = ScheduleEvaluator().evaluate(schedule, low_anc, horizon=date(2026, 3, 1)).events[0]
+    assert result.condition_result == "TRUE"
+    assert result.timing.nominal_start == date(2026, 1, 8)
+
+
+def test_cohort_triggered_timing_already_works_with_no_new_schema():
+    """Confirms "cohort-triggered timing" (different visit cadence per
+    cohort) is already fully handled: two events, each applicability-gated
+    to its own cohort via the existing COHORT dimension, each with its own
+    independent timing -- no cohort-aware timing variant needed in the
+    engine itself. If a real protocol's per-cohort cadence isn't extracted
+    this way, the fix is in extraction, not the schema."""
+    cohort_a_visit = Event(
+        code="VISIT", protocol_label="Cohort A visit", display_name="Cohort A visit", event_type="VISIT",
+        timing=OffsetTiming(reference=AnchorReference(code="BASELINE"), offset=TemporalAmount(value=14, unit="DAY")),
+        applicability=[ApplicabilityRule(dimension="COHORT", values=["COHORT_A"])],
+    )
+    schedule = schedule_with(cohort_a_visit)
+    schedule.cohorts = [
+        StudyDimension(code="COHORT_A", protocol_label="Cohort A", display_name="Cohort A"),
+        StudyDimension(code="COHORT_B", protocol_label="Cohort B", display_name="Cohort B"),
+    ]
+
+    cohort_b_context = context(schedule, cohort_code="COHORT_B")
+    result = ScheduleEvaluator().evaluate(schedule, cohort_b_context, horizon=date(2026, 3, 1)).events[0]
+    assert result.applicability_result == "FALSE"
+
+    cohort_a_context = context(schedule, cohort_code="COHORT_A")
+    result = ScheduleEvaluator().evaluate(schedule, cohort_a_context, horizon=date(2026, 3, 1)).events[0]
+    assert result.applicability_result == "TRUE"
+    assert result.timing.nominal_start == date(2026, 1, 15)
 
 
 def test_non_approved_schedule_cannot_generate_patient_dates():

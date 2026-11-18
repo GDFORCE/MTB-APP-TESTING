@@ -4371,9 +4371,9 @@ async def my_visits(user=Depends(current_user)):
     visits = await db.visits.find({'trial_id': patient['trial_id']}, {'_id': 0}).sort('visit_number', 1).to_list(200)
     completed = set(patient.get('completed_visit_ids', []))
     result = []
-    base_date = _patient_visit_anchor(patient)
     for v in visits:
         try:
+            base_date = _patient_visit_anchor(patient)
             scheduled = _calculate_template_datetime(base_date, v)
             scheduled_end = _calculate_template_end_datetime(base_date, v, scheduled)
             window_start, window_end = _schedule_window(v, scheduled)
@@ -4445,8 +4445,12 @@ async def my_visit_detail(visit_id: str, user=Depends(current_user)):
 
 def _patient_visit_anchor(patient) -> datetime:
     """The date a patient's visit schedule anchors on: their baseline date when
-    present, else the enrolment date (legacy / seed patients), else now. Always
-    returned tz-aware (UTC) so date math is stable."""
+    present, else the enrolment date (legacy / seed patients). Never guesses an
+    anchor from the current time — a patient record with neither date is a data
+    problem, not a scheduling input, so callers must treat it the same as any
+    other calculation failure (manual_review) instead of silently computing
+    dates off "right now". Always returned tz-aware (UTC) so date math is
+    stable."""
     base = None
     for cand in (patient.get('baseline_date'), patient.get('enrolled_date')):
         if cand:
@@ -4456,7 +4460,10 @@ def _patient_visit_anchor(patient) -> datetime:
             except (TypeError, ValueError):
                 continue
     if base is None:
-        base = now()
+        raise ValueError(
+            'Patient has no valid baseline or enrollment date; '
+            'a visit schedule cannot be anchored without one'
+        )
     if base.tzinfo is None:
         base = base.replace(tzinfo=timezone.utc)
     return base
@@ -4859,11 +4866,11 @@ async def materialize_visit_instances(patient) -> int:
                  and _template_matches_arm(t, patient.get('arm_label'))]
     if not templates:
         return 0
-    base = _patient_visit_anchor(patient)
     completed = set(patient.get('completed_visit_ids') or [])
     docs = []
     for t in templates:
         try:
+            base = _patient_visit_anchor(patient)
             sched = _calculate_template_datetime(base, t)
             scheduled_end = _calculate_template_end_datetime(base, t, sched)
             window_start, window_end = _schedule_window(t, sched)
@@ -4946,8 +4953,8 @@ async def _materialize_new_template_for_enrolled(template) -> int:
         # never retro-fitted onto them.
         if not _template_matches_arm(template, patient.get('arm_label')):
             continue
-        base = _patient_visit_anchor(patient)
         try:
+            base = _patient_visit_anchor(patient)
             sched = _calculate_template_datetime(base, template)
             scheduled_end = _calculate_template_end_datetime(base, template, sched)
             window_start, window_end = _schedule_window(template, sched)
@@ -5027,7 +5034,7 @@ async def _rematerialize_template_change(template) -> int:
     number of instances updated."""
     n = now()
     updated = 0
-    anchors: Dict[str, datetime] = {}
+    anchors: Dict[str, datetime | ValueError] = {}
     async for inst in db.visit_instances.find(
             {'visit_template_id': template['id']}, {'_id': 0}):
         if not _instance_is_repointable(inst, n):
@@ -5035,8 +5042,19 @@ async def _rematerialize_template_change(template) -> int:
         pid = inst['patient_id']
         if pid not in anchors:
             patient = await db.patients.find_one({'id': pid}, {'_id': 0})
-            anchors[pid] = _patient_visit_anchor(patient) if patient else n
+            if patient is None:
+                anchors[pid] = n
+            else:
+                try:
+                    anchors[pid] = _patient_visit_anchor(patient)
+                except ValueError as exc:
+                    # Cache the failure itself so every pending instance for
+                    # this patient degrades to manual_review the same way,
+                    # without a redundant DB lookup or a fabricated "now" date.
+                    anchors[pid] = exc
         try:
+            if isinstance(anchors[pid], Exception):
+                raise anchors[pid]
             sched = _calculate_template_datetime(anchors[pid], template)
             scheduled_end = _calculate_template_end_datetime(
                 anchors[pid], template, sched)
@@ -9497,6 +9515,9 @@ async def current_uctsm_user(user=Depends(current_user)):
     return {**user, 'organization_id': organization['id']}
 
 app.include_router(create_uctsm_router(current_uctsm_user))
+
+from app.api.uctsm_admin import create_uctsm_admin_router  # noqa: E402
+app.include_router(create_uctsm_admin_router(current_user))
 
 @app.middleware('http')
 async def disable_legacy_schedule_authoring(request: Request, call_next):

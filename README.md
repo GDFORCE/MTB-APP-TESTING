@@ -67,6 +67,18 @@ hours under a user-scoped extraction ID. After the trial is created, the Visit
 Schedule screen consumes that prepared result without uploading the PDF or
 calling the AI again.
 
+### Provider safety guarantees are not equal
+
+Only the Gemini provider runs the full classify → evidence sweep → synthesize
+→ confirm → audit → repair pipeline described above. Claude, OpenRouter/
+DeepSeek, and local Ollama are single-shot extractors with no classification
+stage, no full-document evidence sweep, and no audit/repair loop. Selecting
+one of them logs an explicit warning naming exactly what safety mechanism is
+missing. Set `PROTOCOL_EXTRACTION_REQUIRE_FULL_SAFETY=true` to reject any
+non-Gemini provider outright instead of degrading silently — recommended for
+production, left off by default so Ollama's offline/local workflow below
+keeps working without extra configuration.
+
 ### Local protocol extraction (no AI API key)
 
 For offline development on Windows, install Ollama, then download the small

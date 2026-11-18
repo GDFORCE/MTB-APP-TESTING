@@ -2013,11 +2013,42 @@ class OllamaProtocolExtractor:
 
 
 def get_extractor() -> ProtocolExtractor:
-    """Factory — swap the returned implementation to change backends."""
+    """Factory — swap the returned implementation to change backends.
+
+    Provider strategy (see docs/protocol-extraction-current-approach-and-case-handling.md
+    section 4): only the Gemini backend runs the full classify -> full-document
+    evidence sweep -> synthesize -> independent confirm -> audit -> repair
+    pipeline. Claude, OpenRouter/DeepSeek, and local Ollama are explicitly
+    single-shot -- no archetype composition, no evidence sweep, no audit/
+    refine loop. This is a real, intentional capability gap between
+    providers, not an oversight, so it must never be silent:
+      * every non-Gemini selection logs a loud, explicit warning naming
+        exactly what safety mechanism is absent;
+      * set PROTOCOL_EXTRACTION_REQUIRE_FULL_SAFETY=true to make that gap a
+        hard failure instead of a warning -- the explicit opt-in for
+        production, while still allowing Ollama's legitimate offline/local
+        development workflow (see README.md) by default.
+    """
     provider = os.getenv(
         "PROTOCOL_EXTRACTION_PROVIDER", DEFAULT_PROVIDER).strip().lower()
+    require_full_safety = os.getenv(
+        "PROTOCOL_EXTRACTION_REQUIRE_FULL_SAFETY", "").strip().lower() in {"1", "true", "yes"}
     if provider in ("gemini", "google"):
         return GeminiProtocolExtractor()
+    if provider in ("claude", "anthropic", "openrouter", "deepseek", "ollama", "qwen", "local"):
+        message = (
+            f"PROTOCOL_EXTRACTION_PROVIDER={provider!r} has no classification stage, no "
+            "full-document evidence sweep, and no independent-confirmation/audit/repair "
+            "loop -- only the Gemini provider has these. This provider's extraction "
+            "confidence and coverage guarantees are weaker; treat its results with "
+            "correspondingly more scrutiny during clinical review."
+        )
+        if require_full_safety:
+            raise ExtractionNotConfigured(
+                f"{message} PROTOCOL_EXTRACTION_REQUIRE_FULL_SAFETY is set, so this "
+                "provider is rejected; switch to PROTOCOL_EXTRACTION_PROVIDER=gemini."
+            )
+        log.warning(message)
     if provider in ("claude", "anthropic"):
         return ClaudeProtocolExtractor()
     if provider in ("openrouter", "deepseek"):

@@ -70,6 +70,62 @@ class ProtocolDocumentIndex(BaseModel):
     boilerplate_lines: list[str] = Field(default_factory=list)
 
 
+class PossibleSubdocumentBoundary(BaseModel):
+    """A deterministic, review-only signal -- never an authoritative split.
+
+    Confidently auto-segmenting a clinical document is exactly the kind of
+    invented structure this system avoids elsewhere (no guessed dates, no
+    silently-accepted unsupported patterns). This is reconnaissance for a
+    human reviewer: "does this one upload actually contain more than one
+    protocol/sub-study document bound together?" -- never an automatic split.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    page_number: int = Field(ge=1)
+    reason: Literal["PAGE_NUMBERING_RESET"]
+    evidence_text: str
+
+
+_PAGE_ONE_RESET = re.compile(r"\bpage\s*1\b(?!\d)", re.IGNORECASE)
+
+
+def detect_possible_subdocument_boundaries(
+    index: ProtocolDocumentIndex,
+) -> list[PossibleSubdocumentBoundary]:
+    """Flag pages whose own text restarts "Page 1" -- a later, separately-
+    paginated document bound into the same upload (e.g. a protocol plus an
+    appended sub-study/PK supplement) would do this; an ordinary running
+    header never does, because a real running header's own page number keeps
+    incrementing. The document's own real page 1 is never flagged.
+
+    A second heuristic ("does the opening title line repeat elsewhere?") was
+    tried and rejected: verified empirically against a real 137-page protocol
+    PDF, it fired on 116/136 later pages purely because the title legitimately
+    repeats in every page's running header -- that is the normal pattern, not
+    an anomaly, so it produced only noise. PAGE_NUMBERING_RESET alone produced
+    zero false positives on that same document.
+
+    This is a heuristic operating on raw page text, not `searchable_text`
+    (which already strips cross-page boilerplate and could hide the very
+    reset this function looks for). False positives are still possible on
+    other real documents -- this only ever produces a finding for a human to
+    confirm, never an automatic action.
+    """
+    if not index.pages:
+        return []
+    signals: list[PossibleSubdocumentBoundary] = []
+    for page in index.pages[1:]:
+        match = _PAGE_ONE_RESET.search(page.text)
+        if match:
+            start = max(0, match.start() - 20)
+            signals.append(PossibleSubdocumentBoundary(
+                page_number=page.page_number, reason="PAGE_NUMBERING_RESET",
+                evidence_text=page.text[start:match.end() + 20].strip(),
+            ))
+    return signals
+
+
 class RetrievedProtocolPage(BaseModel):
     """A selected page plus an auditable explanation of why it was selected."""
 

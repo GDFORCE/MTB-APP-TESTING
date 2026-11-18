@@ -130,7 +130,37 @@ def _decomposition_responses():
     ]
 
 
-def test_agent_repairs_then_reaudits_until_verified():
+def test_agent_surfaces_a_possible_subdocument_boundary_as_a_review_finding():
+    """Proves the real wiring, not just the standalone detector: a page
+    index whose own text restarts "Page 1" produces a human-reviewable
+    verification_issue through the same stage_warnings channel used for
+    every other pipeline-level finding -- without touching any AI call or
+    node logic, and the AI-authored result still comes through unchanged."""
+    from protocol_document_index import build_protocol_document_index
+
+    responses = _decomposition_responses() + [_schedule("Baseline", 0), _audit(approved=True)]
+    pdf_bytes = b"%PDF-subdocument-boundary-test"
+    page_index = build_protocol_document_index(pdf_bytes, extracted_pages=[
+        "Main Study Protocol ABC-123\nPage 1\nSynopsis",
+        "Main Study Protocol ABC-123\nPage 2\nSchedule of Assessments",
+        "Appendix C: PK Sub-Study Protocol\nPage 1\nPK Synopsis",
+    ])
+
+    async def generate(pdf_bytes, prompt, schema, **kwargs):
+        response = responses.pop(0)
+        assert isinstance(response, schema)
+        return response
+
+    result = asyncio.run(run_schedule_extraction_agent(
+        pdf_bytes, generate, max_refinements=2, page_index=page_index))
+
+    assert result.visits[0].name == "Baseline"  # the AI result is untouched
+    assert any(
+        "Page numbering appears to restart at page(s) 3" in issue
+        for issue in result.verification_issues
+    )
+
+
     responses = _decomposition_responses() + [
         _schedule("Baseline", 0),
         _audit(approved=False, finding="Day 30 follow-up is missing."),

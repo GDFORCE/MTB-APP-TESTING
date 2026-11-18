@@ -21,6 +21,7 @@ from protocol_document_index import (
     RetrievalTask,
     build_protocol_document_index,
     chunk_protocol_pages,
+    detect_possible_subdocument_boundaries,
     render_page_chunk,
     render_page_selection,
     retrieve_protocol_pages,
@@ -2200,6 +2201,21 @@ async def _run_schedule_extraction_graph(
         "stage_checkpoint": checkpoint,
         "selected_schedule_option_id": (selected_schedule_option_id or "").strip() or None,
     }
+    if page_index is not None:
+        boundary_signals = detect_possible_subdocument_boundaries(page_index)
+        if boundary_signals:
+            # Deterministic, review-only reconnaissance -- never an automatic
+            # split. Routed through the same unresolved-findings channel as
+            # every other stage warning (finalize_node -> verification_issues),
+            # so a human reviewer decides whether this upload actually
+            # contains more than one protocol/sub-study document.
+            pages = ", ".join(str(signal.page_number) for signal in boundary_signals)
+            initial_state["stage_warnings"] = [
+                f"Page numbering appears to restart at page(s) {pages}, which can mean this "
+                "upload contains more than one separately-paginated document (e.g. a protocol "
+                "plus an appended sub-study/PK supplement). Confirm this is one protocol before "
+                "approving its schedule, or split and re-upload the documents separately."
+            ]
     if classification is not None:
         initial_state["classification"] = classification
     return await graph.ainvoke(initial_state)

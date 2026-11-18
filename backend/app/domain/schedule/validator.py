@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from uuid import UUID
 
+from .extension_handlers import get_timing_extension
 from .models import (
     IssueStatus,
     InterpretationStatus,
@@ -249,12 +250,24 @@ class ScheduleValidator:
                     "AMBIGUOUS_TIMING", event.timing.reason,
                     entity_type="EVENT", entity_id=event.id,
                 ))
-            elif isinstance(event.timing, (ProtocolDefinedTiming, ApproximateTiming)):
+            elif isinstance(event.timing, ApproximateTiming):
                 issues.append(self._issue(
                     "UNSUPPORTED_TIMING",
                     "Timing requires a reviewed deterministic policy before execution",
                     entity_type="EVENT", entity_id=event.id,
                 ))
+            elif isinstance(event.timing, ProtocolDefinedTiming):
+                if get_timing_extension(event.timing.handler) is None:
+                    issues.append(self._issue(
+                        "UNSUPPORTED_TIMING",
+                        (
+                            f"Timing names handler {event.timing.handler!r}, which has no "
+                            "installed deterministic logic yet"
+                        ) if event.timing.handler else
+                        "Timing is PROTOCOL_DEFINED but names no handler to execute it",
+                        entity_type="EVENT", entity_id=event.id,
+                        details={"handler": event.timing.handler},
+                    ))
             if event.interpretation_status in {
                 InterpretationStatus.AMBIGUOUS,
                 InterpretationStatus.CONFLICTING,

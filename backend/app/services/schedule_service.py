@@ -42,6 +42,50 @@ class ScheduleReviewService:
         ))
         return issues
 
+    def revalidate_for_handler(self, handler: str) -> list[dict[str, object]]:
+        """Re-run deterministic validation for every schedule version
+        currently blocked by the named PROTOCOL_DEFINED handler -- the actual
+        "process the path for everything blocked by this gap" action, run
+        once right after a new handler is registered.
+
+        This never re-extracts or re-calls the AI: the schedule's
+        interpretation (its ProtocolDefinedTiming + handler name) was already
+        correct and is untouched. Only the deterministic re-check needed
+        updating, because the handler now exists.
+
+        One schedule failing (e.g. it was approved in the meantime, which
+        makes it immutable) does not stop the rest of the batch -- mirrors
+        the existing "one option failing does not fail the whole batch"
+        pattern used elsewhere in extraction.
+        """
+        rows = self.session.scalars(select(db.ValidationIssue).where(
+            db.ValidationIssue.issue_code == "UNSUPPORTED_TIMING",
+            db.ValidationIssue.status == "OPEN",
+            db.ValidationIssue.blocking.is_(True),
+        )).all()
+        affected_version_ids = {
+            row.schedule_version_id for row in rows
+            if isinstance(row.details, dict) and row.details.get("handler") == handler
+        }
+        results: list[dict[str, object]] = []
+        for version_id in affected_version_ids:
+            try:
+                issues = self.validate(version_id)
+            except ImmutableScheduleError as error:
+                results.append({
+                    "schedule_version_id": version_id, "fully_clear": False,
+                    "error": str(error), "remaining_blocking_issue_codes": [],
+                })
+                continue
+            blocking = ScheduleValidator.blocking(issues)
+            results.append({
+                "schedule_version_id": version_id,
+                "fully_clear": not blocking,
+                "remaining_blocking_issue_codes": sorted({item.issue_code for item in blocking}),
+                "error": None,
+            })
+        return results
+
     def correct_event(self, schedule_version_id: UUID, event: Event, *, reviewer_id: UUID, reason: str) -> list[ValidationIssue]:
         version = self.session.get(db.ScheduleVersion, schedule_version_id)
         if version is None:

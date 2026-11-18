@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
 
@@ -14,6 +16,7 @@ from protocol_extraction import (  # noqa: E402
     CanonicalScheduleResponse,
     ExtractedSchedule,
     ExtractionError,
+    ExtractionNotConfigured,
     GeminiProtocolExtractor,
     OllamaProtocolExtractor,
     OpenRouterProtocolExtractor,
@@ -574,6 +577,32 @@ def test_provider_switch_selects_gemini(monkeypatch):
     monkeypatch.setenv("PROTOCOL_EXTRACTION_PROVIDER", "gemini")
     assert isinstance(get_extractor(), GeminiProtocolExtractor)
     assert isinstance(get_details_extractor(), GeminiProtocolExtractor)
+
+
+def test_gemini_is_exempt_from_the_provider_safety_guard_even_when_required(monkeypatch, caplog):
+    monkeypatch.setenv("PROTOCOL_EXTRACTION_PROVIDER", "gemini")
+    monkeypatch.setenv("PROTOCOL_EXTRACTION_REQUIRE_FULL_SAFETY", "true")
+    with caplog.at_level("WARNING"):
+        assert isinstance(get_extractor(), GeminiProtocolExtractor)
+    assert not any("no classification stage" in record.message for record in caplog.records)
+
+
+def test_non_gemini_providers_log_a_loud_explicit_safety_warning_by_default(monkeypatch, caplog):
+    monkeypatch.setenv("PROTOCOL_EXTRACTION_PROVIDER", "claude")
+    with caplog.at_level("WARNING"):
+        extractor = get_extractor()
+    assert isinstance(extractor, ClaudeProtocolExtractor)
+    assert any(
+        "no classification stage" in record.message and "'claude'" in record.message
+        for record in caplog.records
+    )
+
+
+def test_require_full_safety_rejects_non_gemini_providers_instead_of_silently_degrading(monkeypatch):
+    monkeypatch.setenv("PROTOCOL_EXTRACTION_PROVIDER", "ollama")
+    monkeypatch.setenv("PROTOCOL_EXTRACTION_REQUIRE_FULL_SAFETY", "true")
+    with pytest.raises(ExtractionNotConfigured, match="PROTOCOL_EXTRACTION_REQUIRE_FULL_SAFETY"):
+        get_extractor()
 
 
 def test_provider_switch_selects_claude(monkeypatch):

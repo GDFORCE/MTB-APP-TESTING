@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 
 from .condition import TruthValue, evaluate_condition
 from .exceptions import ScheduleNotApprovedError, UnsupportedTimingError
+from .extension_handlers import get_timing_extension
 from .models import (
     ApplicabilityRule,
     EvaluatedEvent,
@@ -168,7 +169,16 @@ def evaluate_timing(expression: object, context: PatientContext) -> ResolvedTimi
         return ResolvedTiming(nominal_start=value, nominal_end=value, precision="EXACT")
     if isinstance(expression, ApproximateTiming):
         raise UnsupportedTimingError("approximate timing requires an approved precision policy")
-    if isinstance(expression, (ProtocolDefinedTiming, UnresolvedTiming)):
+    if isinstance(expression, ProtocolDefinedTiming):
+        handler = get_timing_extension(expression.handler)
+        if handler is not None:
+            return handler(expression, context)
+        raise UnsupportedTimingError(
+            f"timing names handler {expression.handler!r}, which has no installed "
+            "deterministic logic" if expression.handler else
+            "timing is PROTOCOL_DEFINED but names no handler"
+        )
+    if isinstance(expression, UnresolvedTiming):
         raise UnsupportedTimingError("timing is not deterministically executable")
     raise UnsupportedTimingError(f"unsupported timing expression {type(expression).__name__}")
 

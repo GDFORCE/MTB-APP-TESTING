@@ -8,6 +8,7 @@ from protocol_document_index import (
     PdfIndexingError,
     ProtocolDocumentIndexCache,
     build_protocol_document_index,
+    detect_possible_subdocument_boundaries,
     render_page_selection,
     retrieve_protocol_pages,
 )
@@ -35,6 +36,40 @@ def test_build_index_is_stable_and_marks_pages_without_embedded_text():
     assert "confidential protocol" in first.boilerplate_lines
     assert "confidential protocol" not in first.pages[1].searchable_text
     assert first.pages[1].section_markers == ["Schedule of Assessments"]
+
+
+def test_possible_subdocument_boundary_fires_only_on_a_genuine_pagination_reset():
+    """A later page whose own text says "Page 1" again -- a separately
+    paginated sub-study/PK supplement bound into the same upload would do
+    this; an ordinary running header never does (its page number keeps
+    incrementing)."""
+    pages = [
+        "Main Study Protocol ABC-123\nPage 1\nSynopsis",
+        "Main Study Protocol ABC-123\nPage 2\nSchedule of Assessments",
+        "Appendix C: PK Sub-Study Protocol\nPage 1\nPK Synopsis",
+        "Appendix C: PK Sub-Study Protocol\nPage 2\nPK Schedule",
+    ]
+    signals = detect_possible_subdocument_boundaries(_index(pages))
+    assert len(signals) == 1
+    assert signals[0].page_number == 3
+    assert signals[0].reason == "PAGE_NUMBERING_RESET"
+
+
+def test_possible_subdocument_boundary_ignores_ordinary_incrementing_pagination():
+    pages = [f"Study Protocol ABC-123\nPage {n}\nSome content" for n in range(1, 16)]
+    assert detect_possible_subdocument_boundaries(_index(pages)) == []
+
+
+def test_possible_subdocument_boundary_does_not_false_positive_on_page_ten_to_nineteen():
+    """"Page 1" must not match inside "Page 10".."Page 19" -- the original,
+    more naive regex design risk this exact boundary before the negative
+    lookahead was added."""
+    pages = ["Protocol\nPage 1\nStart"] + [f"Protocol\nPage {n}\nBody" for n in range(10, 20)]
+    assert detect_possible_subdocument_boundaries(_index(pages)) == []
+
+
+def test_possible_subdocument_boundary_handles_a_single_page_document():
+    assert detect_possible_subdocument_boundaries(_index(["x"])) == []
 
 
 def test_schedule_retrieval_selects_table_and_adjacent_footnote_pages():

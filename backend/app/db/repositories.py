@@ -295,3 +295,130 @@ class ScheduleRepository:
             evidence=evidence, claim_evidence=claims, validation_issues=issues,
             created_at=version.created_at,
         )
+
+
+def unsupported_extension_handler_frequency(session: Session) -> list[dict[str, object]]:
+    """Rank every still-open, blocking UNSUPPORTED_TIMING issue by the
+    PROTOCOL_DEFINED `handler` name it names, across every schedule version in
+    the database -- the concrete "what to build next" signal for the
+    extension-handler process in `extension_handlers.py`/`builtin_extensions.py`.
+
+    A handler name appearing here has been seen in real/attempted protocol
+    extraction but has no deterministic implementation registered yet. Once a
+    handler for that name is installed and the affected schedules are
+    revalidated, it naturally disappears from this ranking -- there is
+    nothing else to maintain. Rows are sorted by occurrence_count descending,
+    so the most-needed missing handler is always first.
+    """
+    rows = session.scalars(select(db.ValidationIssue).where(
+        db.ValidationIssue.issue_code == "UNSUPPORTED_TIMING",
+        db.ValidationIssue.status == "OPEN",
+        db.ValidationIssue.blocking.is_(True),
+    )).all()
+    buckets: dict[str | None, dict[str, object]] = {}
+    for row in rows:
+        handler = row.details.get("handler") if isinstance(row.details, dict) else None
+        bucket = buckets.setdefault(handler, {
+            "handler": handler, "occurrence_count": 0,
+            "schedule_version_ids": set(), "sample_message": row.message,
+        })
+        bucket["occurrence_count"] = int(bucket["occurrence_count"]) + 1
+        bucket["schedule_version_ids"].add(row.schedule_version_id)  # type: ignore[union-attr]
+    ranked = [
+        {
+            "handler": bucket["handler"],
+            "occurrence_count": bucket["occurrence_count"],
+            "distinct_schedule_versions": len(bucket["schedule_version_ids"]),  # type: ignore[arg-type]
+            "sample_message": bucket["sample_message"],
+        }
+        for bucket in buckets.values()
+    ]
+    ranked.sort(key=lambda item: item["occurrence_count"], reverse=True)  # type: ignore[arg-type,return-value]
+    return ranked
+
+
+def unsupported_pattern_alert_payloads(
+    session: Session, *, already_alerted: frozenset[str] = frozenset(),
+) -> list[dict[str, object]]:
+    """Build admin-facing, ready-to-insert `system_alerts` payloads (Mongo
+    `db.system_alerts` schema: type/description/affected/severity) for every
+    still-unregistered handler NOT already in `already_alerted` -- the actual
+    "direct the admin what to do" ticket, generated from real occurrence data
+    rather than raw technical logs.
+
+    Callers own de-duplication: pass the set of handler names that already
+    have an open alert so this never creates a second one for the same gap.
+    Severity escalates with real impact (more blocked protocols = higher
+    priority), matching the existing alert severities already used elsewhere
+    in `admin_routes.py`.
+    """
+    payloads = []
+    for row in unsupported_extension_handler_frequency(session):
+        handler = row["handler"]
+        if handler is None or handler in already_alerted:
+            continue
+        occurrence_count = row["occurrence_count"]
+        distinct = row["distinct_schedule_versions"]
+        severity = "high" if occurrence_count >= 5 else "medium" if occurrence_count >= 2 else "low"
+        payloads.append({
+            "type": "unsupported_protocol_pattern",
+            "description": (
+                f"Protocol pattern {handler!r} has no installed deterministic handler. "
+                f"{row['sample_message']}"
+            ),
+            "affected": f"{occurrence_count} issue(s) across {distinct} protocol schedule(s)",
+            "severity": severity,
+            "status": "open",
+            "handler": handler,
+        })
+    return payloads
+
+
+def unsupported_handler_evidence(
+    session: Session, handler: str, *, limit: int = 10,
+) -> list[dict[str, object]]:
+    """The actual protocol text behind a named gap -- real quotes, their page
+    numbers, and which schedule version each came from -- so a developer can
+    design the correct fix without manually opening every affected protocol's
+    review screen one by one.
+
+    Joins each still-open, blocking UNSUPPORTED_TIMING issue (for `handler`)
+    to its flagged Event, then to that event's own cited Evidence rows.
+    Deduplicates identical quotes (the same wording often repeats verbatim
+    across amendments/protocols) and caps the result -- this is reconnaissance
+    for a developer, not a replacement for reading the real protocol if the
+    pattern turns out to be more subtle than the quotes alone suggest.
+    """
+    rows = session.scalars(select(db.ValidationIssue).where(
+        db.ValidationIssue.issue_code == "UNSUPPORTED_TIMING",
+        db.ValidationIssue.status == "OPEN",
+        db.ValidationIssue.blocking.is_(True),
+    )).all()
+    event_ids: list[tuple[UUID, UUID]] = []  # (schedule_version_id, event_id)
+    for row in rows:
+        if (
+            isinstance(row.details, dict) and row.details.get("handler") == handler
+            and row.entity_type == "EVENT" and row.entity_id is not None
+        ):
+            event_ids.append((row.schedule_version_id, row.entity_id))
+    seen_quotes: set[str] = set()
+    quotes: list[dict[str, object]] = []
+    for schedule_version_id, event_id in event_ids:
+        event = session.get(db.Event, event_id)
+        if event is None or not event.evidence_refs:
+            continue
+        evidence_rows = session.scalars(select(db.Evidence).where(
+            db.Evidence.id.in_([UUID(str(ref)) for ref in event.evidence_refs]),
+        )).all()
+        for evidence in evidence_rows:
+            text = (evidence.source_text or "").strip()
+            if not text or text in seen_quotes:
+                continue
+            seen_quotes.add(text)
+            quotes.append({
+                "source_text": text, "page_number": evidence.page_number,
+                "schedule_version_id": schedule_version_id,
+            })
+            if len(quotes) >= limit:
+                return quotes
+    return quotes
